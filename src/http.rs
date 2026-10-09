@@ -1,0 +1,276 @@
+//! The routes. Every repository is addressed by its format first, then its
+//! application's coordinate: `/apt/<npub>/<d>`, `/rpm/<npub>/<d>`.
+
+// Handlers return early with a response from helpers; boxing it would only
+// add noise to every call.
+#![allow(clippy::result_large_err)]
+
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::get;
+
+use crate::inspect::Format;
+use crate::nostr::{is_hex64, nip19};
+use crate::repo::{BuildError, CHANNELS, Repo, Repos, channel_rank};
+use crate::version::valid_package_name;
+
+pub struct AppState {
+    pub repos: Arc<Repos>,
+    /// Where the gateway is reached, for the setup files: no trailing slash.
+    pub public_url: String,
+}
+
+type Shared = State<Arc<AppState>>;
+
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/key.asc", get(key))
+        .route("/apt/{owner}/{d}", get(status))
+        .route("/apt/{owner}/{d}/source", get(apt_source))
+        .route("/apt/{owner}/{d}/dists/{suite}/{*path}", get(apt_dists))
+        .route("/apt/{owner}/{d}/pool/{sha256}/{file}", get(apt_pool))
+        .route("/rpm/{owner}/{d}", get(status))
+        .route("/rpm/{owner}/{d}/repo", get(rpm_repo))
+        .route("/rpm/{owner}/{d}/{channel}/repodata/{file}", get(rpm_repodata))
+        .route("/rpm/{owner}/{d}/{channel}/packages/{sha256}/{file}", get(rpm_package))
+        .with_state(state)
+}
+
+/// An error a person reads: plain text, a sentence.
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], message.into() + "\n").into_response()
+}
+
+fn text(content_type: &'static str, body: impl Into<Vec<u8>>) -> Response {
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=60")], body.into()).into_response()
+}
+
+/// An npub, or a hex pubkey, as hex.
+fn owner(value: &str) -> Option<String> {
+    if is_hex64(value) {
+        return Some(value.to_string());
+    }
+    match nip19::decode(value) {
+        Ok(nip19::Decoded::Npub(pubkey)) => Some(pubkey),
+        _ => None,
+    }
+}
+
+/// The repository at `owner`/`d`, built if it has to be.
+async fn repo(state: &AppState, owner_value: &str, d: &str) -> Result<Arc<Repo>, Response> {
+    let Some(pubkey) = owner(owner_value) else {
+        return Err(error(StatusCode::NOT_FOUND, format!("{owner_value:?} isn't an npub.")));
+    };
+    if !valid_package_name(d) {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("{d:?} can't be a package name: those are lowercase letters, digits, '+', '-' and '.', at least two long."),
+        ));
+    }
+    state.repos.get(&pubkey, d).await.map_err(|failure| match failure {
+        BuildError::NotFound(message) => error(StatusCode::NOT_FOUND, message),
+        BuildError::Failed(message) => error(StatusCode::BAD_GATEWAY, message),
+    })
+}
+
+async fn index(State(state): Shared) -> Response {
+    text(
+        "text/plain; charset=utf-8",
+        format!(
+            "npkg-gateway: apt and dnf repositories for software released on Nostr (NIP-82).\n\n\
+             apt:  {0}/apt/<npub>/<app-id>\n\
+             dnf:  {0}/rpm/<npub>/<app-id>\n\
+             key:  {0}/key.asc ({1})\n",
+            state.public_url,
+            state.repos.signer().fingerprint()
+        ),
+    )
+}
+
+async fn key(State(state): Shared) -> Response {
+    text("application/pgp-keys", state.repos.signer().public_key().to_string())
+}
+
+/// What a repository holds, what it left out and why, and how to add it.
+async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) -> Response {
+    let repo = match repo(&state, &owner, &d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    let npub = nip19::npub_encode(&repo.pubkey);
+    let base = &state.public_url;
+    let mut out = format!("{} ({})\n", repo.name, repo.d);
+    if let Some(summary) = &repo.summary {
+        let _ = writeln!(out, "{summary}");
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "Debian, Ubuntu:\n  sudo curl -fsSL -o /etc/apt/sources.list.d/{d}.sources {base}/apt/{npub}/{d}/source\n  sudo apt update && sudo apt install {d}\n"
+    );
+    let _ =
+        writeln!(out, "Fedora, RHEL:\n  sudo curl -fsSL -o /etc/yum.repos.d/{d}.repo {base}/rpm/{npub}/{d}/repo\n  sudo dnf install {d}\n");
+    let _ = writeln!(out, "Channels: {} (add ?channel=beta to either setup URL)\n", CHANNELS.join(", "));
+
+    let _ = writeln!(out, "Packages:");
+    if repo.packages.is_empty() {
+        let _ = writeln!(out, "  none");
+    }
+    for package in &repo.packages {
+        let _ = writeln!(
+            out,
+            "  {} {} {} [{}] {}",
+            package.version,
+            package.meta.format().as_str(),
+            package.arch,
+            CHANNELS[package.channel],
+            package.sha256
+        );
+    }
+    if !repo.rejections.is_empty() {
+        let _ = writeln!(out, "\nLeft out:");
+        for rejection in &repo.rejections {
+            let _ = writeln!(out, "  {} {}: {}", rejection.version, rejection.sha256, rejection.reason);
+        }
+    }
+    text("text/plain; charset=utf-8", out)
+}
+
+/// The channel a setup file is for: `?channel=`, or the stable one.
+fn setup_channel(query: &HashMap<String, String>) -> Result<&str, Response> {
+    let channel = query.get("channel").map_or("main", String::as_str);
+    if channel_rank(channel).is_none() {
+        return Err(error(StatusCode::BAD_REQUEST, format!("There's no channel {channel:?}. The channels are {}.", CHANNELS.join(", "))));
+    }
+    Ok(channel)
+}
+
+/// A deb822 `.sources` file, with the gateway's key in it, so that adding the
+/// repository is one download.
+async fn apt_source(
+    State(state): Shared,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let repo = match repo(&state, &owner, &d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    let channel = match setup_channel(&query) {
+        Ok("main") => "stable",
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+    let key: String = state
+        .repos
+        .signer()
+        .public_key()
+        .lines()
+        .map(|line| if line.trim().is_empty() { " .\n".to_string() } else { format!(" {line}\n") })
+        .collect();
+    text(
+        "text/plain; charset=utf-8",
+        format!(
+            "# {}, from npkg-gateway\nTypes: deb\nURIs: {}/apt/{}/{}\nSuites: {channel}\nComponents: main\nSigned-By:\n{key}",
+            repo.name,
+            state.public_url,
+            nip19::npub_encode(&repo.pubkey),
+            repo.d
+        ),
+    )
+}
+
+async fn apt_dists(State(state): Shared, Path((owner, d, suite, path)): Path<(String, String, String, String)>) -> Response {
+    let repo = match repo(&state, &owner, &d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    let Some(body) = repo.apt_file(&suite, &path) else {
+        return error(StatusCode::NOT_FOUND, "There's no such file.");
+    };
+    let content_type = if path.ends_with(".gz") { "application/gzip" } else { "text/plain; charset=utf-8" };
+    text(content_type, body.to_vec())
+}
+
+async fn apt_pool(State(state): Shared, Path((owner, d, sha256, _file)): Path<(String, String, String, String)>) -> Response {
+    download(&state, &owner, &d, Format::Deb, &sha256).await
+}
+
+/// A `.repo` file for `/etc/yum.repos.d/`. Packages themselves aren't
+/// signed by anyone dnf knows; the repodata that names their hashes is.
+async fn rpm_repo(
+    State(state): Shared,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let repo = match repo(&state, &owner, &d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    let channel = match setup_channel(&query) {
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+    let npub = nip19::npub_encode(&repo.pubkey);
+    let suffix = if channel == "main" { String::new() } else { format!("-{channel}") };
+    text(
+        "text/plain; charset=utf-8",
+        format!(
+            "[npkg-{d}-{short}{suffix}]\nname={name} ({channel}, from npkg-gateway)\nbaseurl={base}/rpm/{npub}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
+            d = repo.d,
+            short = &repo.pubkey[..8],
+            name = repo.name.replace('\n', " "),
+            base = state.public_url,
+        ),
+    )
+}
+
+async fn rpm_repodata(State(state): Shared, Path((owner, d, channel, file)): Path<(String, String, String, String)>) -> Response {
+    let Some(rank) = channel_rank(&channel) else {
+        return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
+    };
+    let repo = match repo(&state, &owner, &d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    let Some(body) = repo.rpm_file(rank, &format!("repodata/{file}")) else {
+        return error(StatusCode::NOT_FOUND, "There's no such file.");
+    };
+    let content_type = match file.rsplit('.').next() {
+        Some("gz") => "application/gzip",
+        Some("asc") => "application/pgp-signature",
+        _ => "application/xml",
+    };
+    text(content_type, body.to_vec())
+}
+
+async fn rpm_package(
+    State(state): Shared,
+    Path((owner, d, channel, sha256, _file)): Path<(String, String, String, String, String)>,
+) -> Response {
+    if channel_rank(&channel).is_none() {
+        return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
+    }
+    download(&state, &owner, &d, Format::Rpm, &sha256).await
+}
+
+/// A redirect to the package file on Blossom. apt and dnf check the file
+/// against the hash in the signed index, so where it's served from needn't
+/// be trusted.
+async fn download(state: &AppState, owner: &str, d: &str, format: Format, sha256: &str) -> Response {
+    let repo = match repo(state, owner, d).await {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
+    match repo.download_url(format, sha256) {
+        Some(url) => Redirect::to(url).into_response(),
+        None => error(StatusCode::NOT_FOUND, "This repository has no such package."),
+    }
+}

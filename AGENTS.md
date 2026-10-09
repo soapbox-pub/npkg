@@ -1,0 +1,81 @@
+# npkg-gateway
+
+apt and dnf repositories for software released on Nostr (NIP-82). One
+application is one package, served from `/apt/<npub>/<d>` and
+`/rpm/<npub>/<d>`. See README.md for the rules a package has to follow.
+
+This is a spike: kept simple on purpose, and revised as we go.
+
+## Layout
+
+```
+src/
+  main.rs        the CLI: keygen, serve
+  http.rs        the routes, setup files, and the status page
+  repo.rs        building a repository: fetch, inspect, choose, pin, render;
+                 cached in memory and rebuilt in the background
+  nip82.rs       application, release and asset events, fetched from relays
+  nostr/         events, NIP-19 (both from npanel), one-shot relay queries
+  inspect/       reading a .deb's control file and an .rpm's header
+  policy.rs      which files a repository serves, and why not the rest
+  version.rs     NIP-82 versions as dpkg and rpm spell them; package names
+  arch.rs        NIP-82 platforms as Debian and rpm architectures
+  apt.rs         dists/<suite>/: Release, InRelease, Packages
+  rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
+  signing.rs     the gateway's Ed25519 OpenPGP key
+  db.rs          SQLite: inspected package files, and pins
+tests/fixtures/  tiny real packages nfpm built (see its README)
+```
+
+## How a build goes
+
+A request for a repository nobody has asked for yet waits while it's built.
+After that it's served from memory and rebuilt in the background once it's
+older than `--ttl`; a failed rebuild keeps the last good one up.
+
+1. Fetch the application, its releases, and their assets from the relays,
+   keeping only events signed by the application's author.
+2. Download each .deb and .rpm asset not seen before, check its sha256, read
+   its metadata, and store that in SQLite by hash. A file's hash never
+   changes, so this happens once per file.
+3. Choose (`policy.rs`), then pin: the first file for a version and
+   architecture is the one served from then on.
+4. Render and sign every channel. Indexes are dated by their newest release,
+   not by the build, so rebuilding the same packages gives the same files
+   and a client between two requests never sees hashes change underneath it.
+
+## Conventions
+
+- Comments explain *why*, not *what*.
+- No `unwrap()` on anything a relay, an author, or a request can influence.
+- Nothing blocking on a runtime thread: SQLite through `Db::call`, parsing
+  and signing through `spawn_blocking`.
+- User-facing error strings are full sentences that say what to do next.
+  They show up on the status page and in HTTP error bodies.
+
+## Verifying changes
+
+```sh
+cargo clippy --all-targets    # no warnings
+cargo fmt --check
+cargo test
+```
+
+What the unit tests can't show is whether apt and dnf accept the result. To
+check that, run the gateway and install a real package in containers:
+
+```sh
+cargo run -- --data data keygen   # once
+cargo run -- --data data serve --listen 127.0.0.1:8099
+N=npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj
+podman run --rm --network host docker.io/library/debian:trixie bash -c "
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null &&
+  curl -fsSL -o /etc/apt/sources.list.d/npanel.sources http://127.0.0.1:8099/apt/$N/npanel/source &&
+  apt-get update && apt-get install -y npanel"
+podman run --rm --network host docker.io/library/rockylinux:8 bash -c "
+  curl -fsSL -o /etc/yum.repos.d/npanel.repo http://127.0.0.1:8099/rpm/$N/npanel/repo &&
+  dnf -y install npanel"
+```
+
+This was last done against npanel 0.6.0 on debian:trixie, ubuntu:24.04,
+fedora:latest and rockylinux:8.

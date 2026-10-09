@@ -1,0 +1,14 @@
+name: hello
+version: ${VERSION}
+arch: amd64
+platform: linux
+maintainer: Test <test@example.com>
+description: A package for the gateway's tests
+license: CC0-1.0
+depends:
+  - coreutils
+contents:
+  - src: hello
+    dst: /usr/bin/hello
+    file_info:
+      mode: 0755
