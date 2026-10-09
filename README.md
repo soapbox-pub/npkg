@@ -47,9 +47,9 @@ after its `d` tag, and nothing else:
 - The first file served for a version and architecture stays. If a release
   is republished with a different file, the new file is ignored.
 
-Each NIP-82 channel is a suite (apt) or a repository (dnf), and each one
-includes every more stable channel: `beta` has `main`'s releases too. apt's
-`stable` is NIP-82's `main`.
+The channels are `stable`, `beta`, `nightly` and `dev`: an apt suite or a
+dnf repository each. Each one includes every more stable channel, so `beta`
+has the stable releases too. `stable` holds the releases NIP-82 tags `main`.
 
 ## Trust
 

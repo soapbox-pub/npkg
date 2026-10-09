@@ -22,10 +22,15 @@ use crate::policy::{self, Candidate, Rejection};
 use crate::signing::Signer;
 use crate::{apt, rpmmd};
 
-/// NIP-82's channels (Appendix B), most stable first. Each suite holds its
-/// own channel's releases and every more stable one's: `beta` users get a
-/// stable release that's newer than the last beta.
-pub const CHANNELS: [&str; 4] = ["main", "beta", "nightly", "dev"];
+/// The channels a repository offers, most stable first: apt suites, and dnf
+/// repositories. Each holds its own releases and every more stable channel's,
+/// so `beta` users get a stable release that's newer than the last beta.
+pub const CHANNELS: [&str; 4] = ["stable", "beta", "nightly", "dev"];
+
+/// NIP-82's channel tags (Appendix B), in the same order as [`CHANNELS`].
+/// NIP-82 calls the stable channel `main`, which is a component in apt, so
+/// that name stays on the Nostr side.
+const RELEASE_CHANNELS: [&str; 4] = ["main", "beta", "nightly", "dev"];
 
 /// The largest package file downloaded to inspect.
 const MAX_PACKAGE: u64 = 512 << 20;
@@ -46,12 +51,8 @@ pub struct Config {
     pub ttl: Duration,
 }
 
-/// A suite or channel name as a rank in [`CHANNELS`]. `stable` is apt's
-/// usual name for what NIP-82 calls `main`.
+/// A channel's rank in [`CHANNELS`].
 pub fn channel_rank(name: &str) -> Option<usize> {
-    if name == "stable" {
-        return Some(0);
-    }
     CHANNELS.iter().position(|channel| *channel == name)
 }
 
@@ -190,11 +191,15 @@ impl Repos {
         let mut rejections = Vec::new();
         let mut wanted = Vec::new();
         for release in &snapshot.releases {
-            let Some(channel) = channel_rank(&release.channel).filter(|_| release.channel != "stable") else {
+            let Some(channel) = RELEASE_CHANNELS.iter().position(|channel| *channel == release.channel) else {
                 rejections.push(Rejection {
                     version: release.version.clone(),
                     sha256: String::new(),
-                    reason: format!("The release's channel, {:?}, isn't one of NIP-82's: {}.", release.channel, CHANNELS.join(", ")),
+                    reason: format!(
+                        "The release's channel, {:?}, isn't one of NIP-82's: {}.",
+                        release.channel,
+                        RELEASE_CHANNELS.join(", ")
+                    ),
                 });
                 continue;
             };
@@ -300,9 +305,6 @@ impl Repos {
             for (rank, channel) in CHANNELS.iter().enumerate() {
                 let included: Vec<&Package> = packages.iter().filter(|package| package.channel <= rank).collect();
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
-                if rank == 0 {
-                    apt.insert("stable".into(), apt::render("stable", &d, &description, &included, &signer)?);
-                }
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
             }
             Ok(Repo { pubkey, d, name, summary, packages, rejections, apt, rpm })

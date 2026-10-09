@@ -145,7 +145,7 @@ async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) 
 
 /// The channel a setup file is for: `?channel=`, or the stable one.
 fn setup_channel(query: &HashMap<String, String>) -> Result<&str, Response> {
-    let channel = query.get("channel").map_or("main", String::as_str);
+    let channel = query.get("channel").map_or(CHANNELS[0], String::as_str);
     if channel_rank(channel).is_none() {
         return Err(error(StatusCode::BAD_REQUEST, format!("There's no channel {channel:?}. The channels are {}.", CHANNELS.join(", "))));
     }
@@ -164,7 +164,6 @@ async fn apt_source(
         Err(response) => return response,
     };
     let channel = match setup_channel(&query) {
-        Ok("main") => "stable",
         Ok(channel) => channel,
         Err(response) => return response,
     };
@@ -219,7 +218,7 @@ async fn rpm_repo(
         Err(response) => return response,
     };
     let npub = nip19::npub_encode(&repo.pubkey);
-    let suffix = if channel == "main" { String::new() } else { format!("-{channel}") };
+    let suffix = if channel == CHANNELS[0] { String::new() } else { format!("-{channel}") };
     text(
         "text/plain; charset=utf-8",
         format!(
