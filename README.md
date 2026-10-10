@@ -31,21 +31,22 @@ less stable channel.
 
 ## What a repository serves
 
-An application is one package. Its repository serves the package named
-after its `d` tag, and nothing else:
+Every `.deb` and `.rpm` its application's releases list, under whatever
+names the files give themselves, the way a PPA serves whatever its owner
+uploads. An application can ship several packages, and its packages needn't
+be named after it: `buzz.armada.app`'s repository serves `armada-desktop`.
+What a package is comes from the file itself, not from the release or the
+asset's tags.
 
-- The package's own name (`Package:` / `Name:`) must be the `d` tag.
-- Its version must be the release's version, with a pre-release written
-  `~pre`, the way nfpm writes it: release `0.3.0-rc.1` means package
-  `0.3.0~rc.1`.
-- Its architecture must match its asset's `f` tag (`linux-x86_64` is
-  `amd64` / `x86_64`), unless the package is `all` / `noarch`.
-- It may not reach other packages: no `Replaces` and no `Obsoletes`, and
-  `Provides` only its own name.
-- A release has one file per format and architecture. If there's more than
-  one, none of them is served.
-- The first file served for a version and architecture stays. If a release
-  is republished with a different file, the new file is ignored.
+- A file is left out if an index can't hold it: a `.deb` for an
+  architecture other than `amd64`, `arm64`, `armhf`, `riscv64` or `all`, or
+  a name dpkg or rpm wouldn't accept.
+- The first file served for a package version (name, version and
+  architecture) stays. A later file claiming the same version, whether from
+  a republished release or another release, is left out: apt and dnf refuse
+  a version whose file changed under them.
+- A file listed by more than one release is served once, in the most stable
+  of their channels.
 
 The channels are `stable`, `beta`, `nightly` and `dev`: an apt suite or a
 dnf repository each. Each one includes every more stable channel, so `beta`
@@ -56,8 +57,9 @@ has the stable releases too. `stable` holds the releases NIP-82 tags `main`.
 apt and dnf can't check Nostr signatures. The gateway checks each event's
 signature and each file's sha256, and then signs the repository metadata
 (`InRelease`, `repomd.xml`) with its own Ed25519 OpenPGP key. Users who add a
-repository are trusting the gateway to have done that, as well as the
-package's author. Package downloads are redirects to Blossom: apt and dnf
+repository are trusting the gateway to have done that, and the author as
+much as any third-party repository: the author can publish any package,
+under any name. Package downloads are redirects to Blossom: apt and dnf
 check each file against the hash in the signed index, so the server a file
 comes from doesn't need to be trusted.
 

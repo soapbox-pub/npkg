@@ -5,17 +5,14 @@
 //! signed with the gateway's key.
 
 mod apt;
-mod arch;
 mod db;
 mod http;
 mod inspect;
 mod nip82;
 mod nostr;
-mod policy;
 mod repo;
 mod rpmmd;
 mod signing;
-mod version;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

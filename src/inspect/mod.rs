@@ -45,6 +45,29 @@ impl Meta {
             Meta::Rpm(_) => Format::Rpm,
         }
     }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Meta::Deb(meta) => meta.package(),
+            Meta::Rpm(meta) => &meta.name,
+        }
+    }
+
+    /// The version as the format's own tools compare it: a deb's `Version`,
+    /// an rpm's `epoch:version-release`.
+    pub fn version(&self) -> String {
+        match self {
+            Meta::Deb(meta) => meta.version().to_string(),
+            Meta::Rpm(meta) => format!("{}:{}-{}", meta.epoch, meta.version, meta.release),
+        }
+    }
+
+    pub fn arch(&self) -> &str {
+        match self {
+            Meta::Deb(meta) => meta.architecture(),
+            Meta::Rpm(meta) => &meta.arch,
+        }
+    }
 }
 
 pub fn inspect(format: Format, bytes: &[u8]) -> anyhow::Result<Meta> {

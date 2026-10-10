@@ -18,7 +18,6 @@ use axum::routing::get;
 use crate::inspect::Format;
 use crate::nostr::{is_hex64, nip19};
 use crate::repo::{BuildError, CHANNELS, Repo, Repos, channel_rank};
-use crate::version::valid_package_name;
 
 pub struct AppState {
     pub repos: Arc<Repos>,
@@ -68,11 +67,9 @@ async fn repo(state: &AppState, owner_value: &str, d: &str) -> Result<Arc<Repo>,
     let Some(pubkey) = owner(owner_value) else {
         return Err(error(StatusCode::NOT_FOUND, format!("{owner_value:?} isn't an npub.")));
     };
-    if !valid_package_name(d) {
-        return Err(error(
-            StatusCode::NOT_FOUND,
-            format!("{d:?} can't be a package name: those are lowercase letters, digits, '+', '-' and '.', at least two long."),
-        ));
+    // Anything NIP-82 allows, short of what would break a path or a file.
+    if d.is_empty() || d.len() > 256 || d.chars().any(|c| c.is_control() || c == '/') {
+        return Err(error(StatusCode::NOT_FOUND, format!("{d:?} isn't an application id this gateway can serve.")));
     }
     state.repos.get(&pubkey, d).await.map_err(|failure| match failure {
         BuildError::NotFound(message) => error(StatusCode::NOT_FOUND, message),
@@ -106,30 +103,57 @@ async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) 
     };
     let npub = nip19::npub_encode(&repo.pubkey);
     let base = &state.public_url;
+    let file = file_stem(&repo.d);
     let mut out = format!("{} ({})\n", repo.name, repo.d);
     if let Some(summary) = &repo.summary {
         let _ = writeln!(out, "{summary}");
     }
     out.push('\n');
-    let _ = writeln!(
-        out,
-        "Debian, Ubuntu:\n  sudo curl -fsSL -o /etc/apt/sources.list.d/{d}.sources {base}/apt/{npub}/{d}/source\n  sudo apt update && sudo apt install {d}\n"
-    );
-    let _ =
-        writeln!(out, "Fedora, RHEL:\n  sudo curl -fsSL -o /etc/yum.repos.d/{d}.repo {base}/rpm/{npub}/{d}/repo\n  sudo dnf install {d}\n");
-    let _ = writeln!(out, "Channels: {} (add ?channel=beta to either setup URL)\n", CHANNELS.join(", "));
+
+    let names = |format: Format| {
+        let mut names: Vec<&str> =
+            repo.packages.iter().filter(|package| package.meta.format() == format).map(|package| package.meta.name()).collect();
+        names.sort();
+        names.dedup();
+        names.join(" ")
+    };
+    let (debs, rpms) = (names(Format::Deb), names(Format::Rpm));
+    if !debs.is_empty() {
+        let _ = writeln!(
+            out,
+            "Debian, Ubuntu:\n  sudo curl -fsSL -o /etc/apt/sources.list.d/{file}.sources {base}/apt/{npub}/{d}/source\n  sudo apt update && sudo apt install {debs}\n",
+            d = segment(&repo.d)
+        );
+    }
+    if !rpms.is_empty() {
+        let _ = writeln!(
+            out,
+            "Fedora, RHEL:\n  sudo curl -fsSL -o /etc/yum.repos.d/{file}.repo {base}/rpm/{npub}/{d}/repo\n  sudo dnf install {rpms}\n",
+            d = segment(&repo.d)
+        );
+    }
+    let _ = writeln!(out, "Channels: {} (add ?channel=beta to either setup URL)", CHANNELS.join(", "));
+    let _ = writeln!(out, "This repository serves whatever packages its author publishes, under any name.\n");
 
     let _ = writeln!(out, "Packages:");
     if repo.packages.is_empty() {
         let _ = writeln!(out, "  none");
     }
-    for package in &repo.packages {
+    let mut packages: Vec<_> = repo.packages.iter().collect();
+    packages.sort_by_key(|package| (package.meta.name(), package.meta.format(), std::cmp::Reverse(package.created_at)));
+    let mut previous = None;
+    for package in packages {
+        let name = package.meta.name();
+        if previous != Some(name) {
+            let _ = writeln!(out, "  {name}");
+            previous = Some(name);
+        }
         let _ = writeln!(
             out,
-            "  {} {} {} [{}] {}",
-            package.version,
+            "    {} {} {} [{}] {}",
+            package.meta.version(),
             package.meta.format().as_str(),
-            package.arch,
+            package.meta.arch(),
             CHANNELS[package.channel],
             package.sha256
         );
@@ -137,10 +161,23 @@ async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) 
     if !repo.rejections.is_empty() {
         let _ = writeln!(out, "\nLeft out:");
         for rejection in &repo.rejections {
-            let _ = writeln!(out, "  {} {}: {}", rejection.version, rejection.sha256, rejection.reason);
+            let _ = writeln!(out, "  {} {}: {}", rejection.release, rejection.sha256, rejection.reason);
         }
     }
     text("text/plain; charset=utf-8", out)
+}
+
+/// `d`, as one segment of a URL path.
+fn segment(d: &str) -> String {
+    d.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
+}
+
+/// `d`, as a file name apt and dnf read: they skip files with other
+/// characters in their names.
+fn file_stem(d: &str) -> String {
+    d.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect()
 }
 
 /// The channel a setup file is for: `?channel=`, or the stable one.
@@ -181,7 +218,7 @@ async fn apt_source(
             repo.name,
             state.public_url,
             nip19::npub_encode(&repo.pubkey),
-            repo.d
+            segment(&repo.d)
         ),
     )
 }
@@ -222,8 +259,9 @@ async fn rpm_repo(
     text(
         "text/plain; charset=utf-8",
         format!(
-            "[npkg-{d}-{short}{suffix}]\nname={name} ({channel}, from npkg-gateway)\nbaseurl={base}/rpm/{npub}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
-            d = repo.d,
+            "[npkg-{id}-{short}{suffix}]\nname={name} ({channel}, from npkg-gateway)\nbaseurl={base}/rpm/{npub}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
+            id = file_stem(&repo.d),
+            d = segment(&repo.d),
             short = &repo.pubkey[..8],
             name = repo.name.replace('\n', " "),
             base = state.public_url,
@@ -271,5 +309,17 @@ async fn download(state: &AppState, owner: &str, d: &str, format: Format, sha256
     match repo.download_url(format, sha256) {
         Some(url) => Redirect::to(url).into_response(),
         None => error(StatusCode::NOT_FOUND, "This repository has no such package."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn makes_ids_safe() {
+        assert_eq!(segment("buzz.armada.app"), "buzz.armada.app");
+        assert_eq!(segment("My App/x"), "My%20App%2Fx");
+        assert_eq!(file_stem("My App"), "My_App");
     }
 }

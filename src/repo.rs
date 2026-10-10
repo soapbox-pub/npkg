@@ -1,11 +1,17 @@
 //! A repository: one NIP-82 application's packages, built from its author's
 //! events, rendered for apt and dnf, and signed.
 //!
+//! A repository serves every .deb and .rpm its application's releases list,
+//! under whatever names the files give themselves, the way a PPA serves
+//! whatever its owner uploads. The release is only how a file is found: what
+//! a package is, is what the file says. Adding a repository trusts its author
+//! as much as adding any third-party repository does.
+//!
 //! A repository is built the first time it's asked for, and that request
 //! waits. After that it's served from memory, and rebuilt in the background
 //! once it's older than the TTL, so no later request waits on relays.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,7 +24,6 @@ use crate::db::{Db, Inspected};
 use crate::inspect::{self, Format, Meta};
 use crate::nip82::{self, Asset};
 use crate::nostr::nip19;
-use crate::policy::{self, Candidate, Rejection};
 use crate::signing::Signer;
 use crate::{apt, rpmmd};
 
@@ -59,16 +64,23 @@ pub fn channel_rank(name: &str) -> Option<usize> {
 /// One file the repository serves.
 #[derive(Clone, Debug)]
 pub struct Package {
-    pub d: String,
-    /// The NIP-82 release's version.
-    pub version: String,
+    /// The version of the NIP-82 release it came from.
+    pub release: String,
     pub channel: usize,
     pub created_at: i64,
-    pub arch: String,
     pub sha256: String,
     pub size: u64,
     pub url: String,
     pub meta: Meta,
+}
+
+/// Why a file was left out, for the log and the repository's status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    /// The version of the NIP-82 release it came from.
+    pub release: String,
+    pub sha256: String,
+    pub reason: String,
 }
 
 pub struct Repo {
@@ -193,7 +205,7 @@ impl Repos {
         for release in &snapshot.releases {
             let Some(channel) = RELEASE_CHANNELS.iter().position(|channel| *channel == release.channel) else {
                 rejections.push(Rejection {
-                    version: release.version.clone(),
+                    release: release.version.clone(),
                     sha256: String::new(),
                     reason: format!(
                         "The release's channel, {:?}, isn't one of NIP-82's: {}.",
@@ -221,65 +233,53 @@ impl Repos {
             .await;
 
         let mut candidates = Vec::new();
-        let mut found: HashMap<String, (i64, usize, Inspected)> = HashMap::new();
         for (release, channel, asset, result) in inspected {
-            let reject = |reason: String| Rejection { version: release.version.clone(), sha256: asset.sha256.clone(), reason };
-            match result {
-                Ok(inspected) => match &inspected.meta {
-                    Ok(meta) => {
-                        candidates.push(Candidate {
-                            release_version: release.version.clone(),
-                            asset_version: asset.version.clone(),
-                            platforms: asset.platforms.clone(),
-                            sha256: asset.sha256.clone(),
-                            meta: meta.clone(),
-                        });
-                        found.insert(asset.sha256.clone(), (release.created_at, channel, inspected));
-                    }
-                    Err(error) => rejections.push(reject(error.clone())),
-                },
+            let reject = |reason: String| Rejection { release: release.version.clone(), sha256: asset.sha256.clone(), reason };
+            match result.map(|inspected| (inspected.meta, inspected.size, inspected.url)) {
+                Ok((Ok(meta), size, url)) => candidates.push(Package {
+                    release: release.version.clone(),
+                    channel,
+                    created_at: release.created_at,
+                    sha256: asset.sha256.clone(),
+                    size,
+                    url,
+                    meta,
+                }),
+                Ok((Err(error), _, _)) => rejections.push(reject(error)),
                 Err(error) => rejections.push(reject(format!("{error:#}"))),
             }
         }
 
-        let (chosen, rejected) = policy::choose(d, candidates);
+        let (candidates, rejected) = select(candidates);
         rejections.extend(rejected);
 
-        let mut packages = Vec::new();
-        for (candidate, arch) in chosen {
+        // apt and dnf refuse a package version whose file changed under them,
+        // so the first file for each one is the one served from then on.
+        let listed: HashSet<String> = candidates.iter().map(|package| package.sha256.clone()).collect();
+        let mut packages: Vec<Package> = Vec::new();
+        for candidate in candidates {
             let format = candidate.meta.format();
-            let Some((created_at, channel, inspected)) = found.get(&candidate.sha256).cloned() else { continue };
-            let pinned = self
-                .db
-                .pin(pubkey, d, format, &candidate.release_version, &arch, &candidate.sha256)
-                .await
-                .map_err(|error| BuildError::Failed(format!("{error:#}")))?;
-
-            let (sha256, inspected) = if pinned == candidate.sha256 {
-                (candidate.sha256, inspected)
-            } else {
-                rejections.push(Rejection {
-                    version: candidate.release_version.clone(),
-                    sha256: candidate.sha256.clone(),
-                    reason: format!("The release was republished with a different {} for {arch}. The first one stays.", format.as_str()),
-                });
-                match self.db.inspected(&pinned).await {
-                    Ok(Some(inspected)) if inspected.meta.is_ok() => (pinned, inspected),
-                    _ => continue,
-                }
-            };
-            let Ok(meta) = inspected.meta else { continue };
-            packages.push(Package {
-                d: d.to_string(),
-                version: candidate.release_version,
-                channel,
-                created_at,
-                arch,
-                sha256,
-                size: inspected.size,
-                url: inspected.url,
-                meta,
+            let key = package_key(&candidate.meta);
+            let pinned =
+                self.db.pin(pubkey, d, format, &key, &candidate.sha256).await.map_err(|error| BuildError::Failed(format!("{error:#}")))?;
+            if pinned == candidate.sha256 {
+                packages.push(candidate);
+                continue;
+            }
+            rejections.push(Rejection {
+                release: candidate.release.clone(),
+                sha256: candidate.sha256.clone(),
+                reason: format!("{key} is served from an earlier file, {pinned}. The first file published for a package version stays."),
             });
+            // The pinned file is served even once no release lists it, in the
+            // place of the one that took its name.
+            if !listed.contains(&pinned)
+                && !packages.iter().any(|package| package.sha256 == pinned)
+                && let Ok(Some(inspected)) = self.db.inspected(&pinned).await
+                && let Ok(meta) = inspected.meta
+            {
+                packages.push(Package { sha256: pinned, size: inspected.size, url: inspected.url, meta, ..candidate });
+            }
         }
         packages.sort_by(|a, b| (a.created_at, &a.sha256).cmp(&(b.created_at, &b.sha256)));
 
@@ -287,7 +287,7 @@ impl Repos {
             tracing::info!(
                 pubkey,
                 d,
-                version = rejection.version,
+                release = rejection.release,
                 sha256 = rejection.sha256,
                 reason = rejection.reason,
                 "package left out"
@@ -372,5 +372,135 @@ impl Repos {
         let actual = hex::encode(Sha256::digest(&bytes));
         anyhow::ensure!(actual == sha256, "{url} served a file whose sha256 is {actual}, not {sha256}.");
         Ok(bytes)
+    }
+}
+
+/// A package version, as apt and dnf tell one from another: name, version
+/// and architecture.
+fn package_key(meta: &Meta) -> String {
+    format!("{} {} {}", meta.name(), meta.version(), meta.arch())
+}
+
+/// Of the files the releases list, those an index can hold, each once, in
+/// the order they're pinned: oldest release first. A file in more than one
+/// release is listed under the most stable of their channels.
+fn select(candidates: Vec<Package>) -> (Vec<Package>, Vec<Rejection>) {
+    let mut rejections = Vec::new();
+    let mut chosen: HashMap<String, Package> = HashMap::new();
+    for candidate in candidates {
+        if let Some(reason) = unlistable(&candidate.meta) {
+            rejections.push(Rejection { release: candidate.release, sha256: candidate.sha256, reason });
+            continue;
+        }
+        match chosen.get(&candidate.sha256) {
+            Some(existing) if (existing.channel, existing.created_at) <= (candidate.channel, candidate.created_at) => {}
+            _ => {
+                chosen.insert(candidate.sha256.clone(), candidate);
+            }
+        }
+    }
+    let mut chosen: Vec<Package> = chosen.into_values().collect();
+    chosen.sort_by(|a, b| (a.created_at, &a.sha256).cmp(&(b.created_at, &b.sha256)));
+    (chosen, rejections)
+}
+
+/// Why a file can't be listed, if it can't.
+fn unlistable(meta: &Meta) -> Option<String> {
+    match meta {
+        Meta::Deb(deb) => {
+            if !apt::valid_name(deb.package()) {
+                return Some(format!("{:?} isn't a name dpkg accepts.", deb.package()));
+            }
+            let arch = deb.architecture();
+            if arch != "all" && !apt::ARCHES.contains(&arch) {
+                return Some(format!("The .deb is for {arch:?}, which isn't one of the architectures served: {}.", apt::ARCHES.join(", ")));
+            }
+        }
+        Meta::Rpm(rpm) => {
+            if !rpm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)) {
+                return Some(format!("{:?} isn't a name rpm accepts.", rpm.name));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspect::deb::parse_control;
+
+    fn deb(control: &str, channel: usize, created_at: i64, sha: char) -> Package {
+        Package {
+            release: "1".into(),
+            channel,
+            created_at,
+            sha256: sha.to_string().repeat(64),
+            size: 1,
+            url: String::new(),
+            meta: Meta::Deb(parse_control(control).unwrap()),
+        }
+    }
+
+    #[test]
+    fn serves_every_name_a_release_has() {
+        let (chosen, rejected) = select(vec![
+            deb("Package: netbird\nVersion: 1\nArchitecture: amd64\n", 0, 1, 'a'),
+            deb("Package: netbird-ui\nVersion: 1\nArchitecture: amd64\n", 0, 1, 'b'),
+        ]);
+        assert!(rejected.is_empty());
+        let names: Vec<_> = chosen.iter().map(|package| package.meta.name()).collect();
+        assert_eq!(names, ["netbird", "netbird-ui"]);
+    }
+
+    #[test]
+    fn leaves_out_what_an_index_cant_hold() {
+        let (chosen, rejected) = select(vec![
+            deb("Package: bat\nVersion: 1\nArchitecture: musl-linux-amd64\n", 0, 1, 'a'),
+            deb("Package: Bat\nVersion: 1\nArchitecture: amd64\n", 0, 1, 'b'),
+            deb("Package: bat\nVersion: 1\nArchitecture: all\n", 0, 1, 'c'),
+        ]);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(rejected.len(), 2);
+    }
+
+    #[test]
+    fn lists_a_file_once_under_its_most_stable_channel() {
+        let control = "Package: x1\nVersion: 1\nArchitecture: amd64\n";
+        let (chosen, _) = select(vec![deb(control, 2, 5, 'a'), deb(control, 0, 9, 'a'), deb(control, 1, 1, 'a')]);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!((chosen[0].channel, chosen[0].created_at), (0, 9));
+    }
+
+    #[test]
+    fn orders_files_oldest_release_first() {
+        let (chosen, _) = select(vec![
+            deb("Package: x1\nVersion: 2\nArchitecture: amd64\n", 0, 20, 'a'),
+            deb("Package: x1\nVersion: 1\nArchitecture: amd64\n", 0, 10, 'b'),
+        ]);
+        let versions: Vec<_> = chosen.iter().map(|package| package.meta.version()).collect();
+        assert_eq!(versions, ["1", "2"]);
+    }
+
+    #[test]
+    fn keys_packages_as_apt_and_dnf_do() {
+        let meta = crate::inspect::rpm::inspect(include_bytes!("../tests/fixtures/hello-1.2.0-rc.1.x86_64.rpm")).unwrap();
+        assert_eq!(package_key(&Meta::Rpm(Box::new(meta))), "hello 0:1.2.0~rc.1-1 x86_64");
+        let deb = parse_control("Package: hello\nVersion: 1:1.2-3\nArchitecture: arm64\n").unwrap();
+        assert_eq!(package_key(&Meta::Deb(deb)), "hello 1:1.2-3 arm64");
+    }
+
+    #[tokio::test]
+    async fn pins_the_first_file_for_a_package_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        assert_eq!(db.pin("pk", "app", Format::Deb, "x 1 amd64", &first).await.unwrap(), first);
+        assert_eq!(db.pin("pk", "app", Format::Deb, "x 1 amd64", &second).await.unwrap(), first);
+        // Another version, format, or repository is a package of its own.
+        assert_eq!(db.pin("pk", "app", Format::Deb, "x 2 amd64", &second).await.unwrap(), second);
+        assert_eq!(db.pin("pk", "app", Format::Rpm, "x 1 amd64", &second).await.unwrap(), second);
+        assert_eq!(db.pin("pk", "other", Format::Deb, "x 1 amd64", &second).await.unwrap(), second);
     }
 }

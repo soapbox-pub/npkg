@@ -1,5 +1,5 @@
 //! SQLite: what each package file was found to be, and which file each
-//! version is pinned to. Everything else is rebuilt from relays.
+//! package version is pinned to. Everything else is rebuilt from relays.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -40,11 +40,10 @@ impl Db {
                pubkey TEXT NOT NULL,
                d TEXT NOT NULL,
                format TEXT NOT NULL,
-               version TEXT NOT NULL,
-               arch TEXT NOT NULL,
+               package TEXT NOT NULL,
                sha256 TEXT NOT NULL,
                pinned_at INTEGER NOT NULL DEFAULT (unixepoch()),
-               PRIMARY KEY (pubkey, d, format, version, arch)
+               PRIMARY KEY (pubkey, d, format, package)
              );",
         )?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
@@ -102,19 +101,20 @@ impl Db {
         Ok(())
     }
 
-    /// Pin `sha256` as the file for this version and architecture, unless one
-    /// already is. Returns the file that is.
-    pub async fn pin(&self, pubkey: &str, d: &str, format: Format, version: &str, arch: &str, sha256: &str) -> anyhow::Result<String> {
-        let args = [pubkey, d, format.as_str(), version, arch, sha256].map(str::to_string);
+    /// Pin `sha256` as the file for `package` (its name, version and
+    /// architecture) in this repository, unless one already is. Returns the
+    /// file that is.
+    pub async fn pin(&self, pubkey: &str, d: &str, format: Format, package: &str, sha256: &str) -> anyhow::Result<String> {
+        let args = [pubkey, d, format.as_str(), package, sha256].map(str::to_string);
         self.call(move |conn| {
             conn.execute(
-                "INSERT INTO pins (pubkey, d, format, version, arch, sha256) VALUES (?, ?, ?, ?, ?, ?)
+                "INSERT INTO pins (pubkey, d, format, package, sha256) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT DO NOTHING",
-                params![args[0], args[1], args[2], args[3], args[4], args[5]],
+                params![args[0], args[1], args[2], args[3], args[4]],
             )?;
             conn.query_row(
-                "SELECT sha256 FROM pins WHERE pubkey = ? AND d = ? AND format = ? AND version = ? AND arch = ?",
-                params![args[0], args[1], args[2], args[3], args[4]],
+                "SELECT sha256 FROM pins WHERE pubkey = ? AND d = ? AND format = ? AND package = ?",
+                params![args[0], args[1], args[2], args[3]],
                 |row| row.get(0),
             )
         })

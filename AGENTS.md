@@ -1,8 +1,9 @@
 # npkg-gateway
 
-apt and dnf repositories for software released on Nostr (NIP-82). One
-application is one package, served from `/apt/<npub>/<d>` and
-`/rpm/<npub>/<d>`. See README.md for the rules a package has to follow.
+apt and dnf repositories for software released on Nostr (NIP-82). Each
+application's repository, at `/apt/<npub>/<d>` and `/rpm/<npub>/<d>`, serves
+every package its releases list, under any name. See README.md for what's
+left out.
 
 This is a spike: kept simple on purpose, and revised as we go.
 
@@ -12,15 +13,12 @@ This is a spike: kept simple on purpose, and revised as we go.
 src/
   main.rs        the CLI: keygen, serve
   http.rs        the routes, setup files, and the status page
-  repo.rs        building a repository: fetch, inspect, choose, pin, render;
+  repo.rs        building a repository: fetch, inspect, select, pin, render;
                  cached in memory and rebuilt in the background
   nip82.rs       application, release and asset events, fetched from relays
   nostr/         events, NIP-19 (both from npanel), one-shot relay queries
   inspect/       reading a .deb's control file and an .rpm's header
-  policy.rs      which files a repository serves, and why not the rest
-  version.rs     NIP-82 versions as dpkg and rpm spell them; package names
-  arch.rs        NIP-82 platforms as Debian and rpm architectures
-  apt.rs         dists/<suite>/: Release, InRelease, Packages
+  apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
   signing.rs     the gateway's Ed25519 OpenPGP key
   db.rs          SQLite: inspected package files, and pins
@@ -38,8 +36,9 @@ older than `--ttl`; a failed rebuild keeps the last good one up.
 2. Download each .deb and .rpm asset not seen before, check its sha256, read
    its metadata, and store that in SQLite by hash. A file's hash never
    changes, so this happens once per file.
-3. Choose (`policy.rs`), then pin: the first file for a version and
-   architecture is the one served from then on.
+3. Select the files an index can hold, each once, then pin: the first file
+   for a package version (name, version, architecture, as the file says) is
+   the one served from then on.
 4. Render and sign every channel. Indexes are dated by their newest release,
    not by the build, so rebuilding the same packages gives the same files
    and a client between two requests never sees hashes change underneath it.

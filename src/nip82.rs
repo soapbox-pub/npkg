@@ -41,8 +41,6 @@ pub struct Asset {
     pub mime: String,
     pub sha256: String,
     pub url: Option<String>,
-    pub version: Option<String>,
-    pub platforms: Vec<String>,
 }
 
 /// Everything one application's author has published about it.
@@ -97,7 +95,9 @@ pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<S
     for ids in asset_ids.chunks(IDS_PER_FILTER) {
         let filter = json!({"ids": ids, "kinds": [ASSET], "authors": [pubkey]});
         for event in relay::query(relays, &[filter], QUERY_TIMEOUT).await? {
-            if event.kind != ASSET || event.pubkey != pubkey || event.tag("i") != Some(d) {
+            // An asset's `i` is its own identifier on its platform, which
+            // NIP-82 lets differ from the application's: it isn't checked.
+            if event.kind != ASSET || event.pubkey != pubkey {
                 continue;
             }
             if let Some(asset) = parse_asset(&event) {
@@ -124,13 +124,7 @@ fn parse_asset(event: &Event) -> Option<Asset> {
     if !is_hex64(&sha256) {
         return None;
     }
-    Some(Asset {
-        mime: event.tag("m")?.to_ascii_lowercase(),
-        sha256,
-        url: event.tag("url").map(str::to_string),
-        version: event.tag("version").map(str::to_string),
-        platforms: tag_values(event, "f").map(str::to_string).collect(),
-    })
+    Some(Asset { mime: event.tag("m")?.to_ascii_lowercase(), sha256, url: event.tag("url").map(str::to_string) })
 }
 
 fn tag_values<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a str> {

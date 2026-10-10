@@ -5,10 +5,14 @@ use std::fmt::Write;
 
 use sha2::{Digest, Sha256};
 
-use crate::arch::DEB_ARCHES;
 use crate::inspect::Meta;
 use crate::repo::Package;
 use crate::signing::Signer;
+
+/// The architectures every suite lists, so that a host of any of them reads
+/// the suite rather than warning that it doesn't support it. A .deb for any
+/// other can't be listed. Packages for `all` go in every one.
+pub const ARCHES: [&str; 4] = ["amd64", "arm64", "armhf", "riscv64"];
 
 /// Fields the gateway writes itself, never copied from a control file.
 const OWN_FIELDS: [&str; 7] = ["Filename", "Size", "MD5sum", "SHA1", "SHA256", "SHA512", "Description-md5"];
@@ -17,9 +21,9 @@ const OWN_FIELDS: [&str; 7] = ["Filename", "Size", "MD5sum", "SHA1", "SHA256", "
 pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], signer: &Signer) -> anyhow::Result<HashMap<String, Vec<u8>>> {
     let mut files = HashMap::new();
     let mut sums = String::new();
-    for arch in DEB_ARCHES {
+    for arch in ARCHES {
         let mut index = String::new();
-        for package in packages.iter().filter(|package| package.arch == arch || package.arch == "all") {
+        for package in packages.iter().filter(|package| package.meta.arch() == arch || package.meta.arch() == "all") {
             let Meta::Deb(meta) = &package.meta else { continue };
             if !index.is_empty() {
                 index.push('\n');
@@ -31,7 +35,7 @@ pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], si
                 }
                 writeln!(index, "{key}: {value}")?;
             }
-            writeln!(index, "Filename: {}", pool_path(package, meta.version(), &package.arch))?;
+            writeln!(index, "Filename: {}", pool_path(package))?;
             writeln!(index, "Size: {}", package.size)?;
             writeln!(index, "SHA256: {}", package.sha256)?;
         }
@@ -50,7 +54,7 @@ pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], si
     let release = format!(
         "Origin: npkg-gateway\nLabel: {d}\nSuite: {suite}\nCodename: {suite}\nDate: {}\nArchitectures: {}\nComponents: main\nDescription: {}\nSHA256:\n{sums}",
         rfc2822(date),
-        DEB_ARCHES.join(" "),
+        ARCHES.join(" "),
         description.replace('\n', " "),
     );
     files.insert("InRelease".into(), signer.sign_cleartext(&release)?.into_bytes());
@@ -61,12 +65,22 @@ pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], si
 
 /// Where apt is told to download a package. Only the hash is read back; the
 /// name is for apt's cache and for people reading logs.
-fn pool_path(package: &Package, version: &str, arch: &str) -> String {
-    let name = format!("{}_{}_{arch}.deb", package.d, version)
+fn pool_path(package: &Package) -> String {
+    let meta = &package.meta;
+    let name = format!("{}_{}_{}.deb", meta.name(), meta.version(), meta.arch())
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || "._+~-".contains(c) { c } else { '_' })
         .collect::<String>();
     format!("pool/{}/{name}", package.sha256)
+}
+
+/// Whether a package name is one dpkg accepts. dpkg itself refuses to build
+/// anything else, so this only matters for a file made by hand to break an
+/// index.
+pub fn valid_name(name: &str) -> bool {
+    name.len() >= 2
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.'))
 }
 
 pub fn gzip(data: &[u8]) -> Vec<u8> {
@@ -105,6 +119,17 @@ pub fn rfc2822(time: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_package_names() {
+        assert!(valid_name("npanel"));
+        assert!(valid_name("buzz.armada.app"));
+        assert!(valid_name("g++"));
+        assert!(!valid_name("x"));
+        assert!(!valid_name("Npanel"));
+        assert!(!valid_name("my_app"));
+        assert!(!valid_name("-x"));
+    }
 
     #[test]
     fn formats_dates() {
