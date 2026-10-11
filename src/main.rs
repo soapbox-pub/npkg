@@ -68,12 +68,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => {
             let signer = Arc::new(signing::Signer::load(&key_path)?);
             let db = db::Db::open(&config.database_path())?;
+            let names = nostr::nip05::Resolver::new(config.ttl, db.clone())?;
             let repos = repo::Repos::new(
                 repo::Config { relays: config.relays.clone(), blossom: config.blossom_servers.clone(), ttl: config.ttl },
                 db,
                 signer,
             )?;
-            let names = nostr::nip05::Resolver::new(config.ttl)?;
             let public_url = config.public_url.clone();
             let app =
                 http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone(), authors: config.authors.clone() }));

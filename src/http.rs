@@ -29,7 +29,7 @@ use crate::{apt, nip82};
 
 pub struct AppState {
     pub repos: Arc<Repos>,
-    pub names: Resolver,
+    pub names: Arc<Resolver>,
     /// Where the gateway is reached, for the setup files: no trailing slash.
     pub public_url: String,
     /// The hex pubkeys whose repositories are served, or `None` for anyone's.

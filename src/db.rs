@@ -1,8 +1,10 @@
-//! SQLite: what each package file was found to be, and which file each
-//! package version is pinned to. Everything else is rebuilt from relays.
+//! SQLite: what each package file was found to be, which file each package
+//! version is pinned to, and the key each NIP-05 address last named.
+//! Everything else is rebuilt from relays.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -44,6 +46,13 @@ impl Db {
                sha256 TEXT NOT NULL,
                pinned_at INTEGER NOT NULL DEFAULT (unixepoch()),
                PRIMARY KEY (pubkey, d, format, package)
+             );
+             CREATE TABLE IF NOT EXISTS nip05 (
+               name TEXT NOT NULL,
+               domain TEXT NOT NULL,
+               pubkey TEXT NOT NULL,
+               resolved_at INTEGER NOT NULL,
+               PRIMARY KEY (name, domain)
              );",
         )?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
@@ -120,4 +129,41 @@ impl Db {
         })
         .await
     }
+
+    /// The key `name@domain` last resolved to, and how long ago.
+    pub async fn nip05(&self, name: &str, domain: &str) -> anyhow::Result<Option<(String, Duration)>> {
+        let (name, domain) = (name.to_string(), domain.to_string());
+        let row = self
+            .call(move |conn| {
+                conn.query_row("SELECT pubkey, resolved_at FROM nip05 WHERE name = ? AND domain = ?", [name, domain], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()
+            })
+            .await?;
+        Ok(row.map(|(pubkey, resolved_at)| (pubkey, Duration::from_secs(unix_now().saturating_sub(resolved_at).max(0) as u64))))
+    }
+
+    pub async fn store_nip05(&self, name: &str, domain: &str, pubkey: &str) -> anyhow::Result<()> {
+        let args = [name, domain, pubkey].map(str::to_string);
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO nip05 (name, domain, pubkey, resolved_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (name, domain) DO UPDATE SET pubkey = excluded.pubkey, resolved_at = excluded.resolved_at",
+                params![args[0], args[1], args[2], unix_now()],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn forget_nip05(&self, name: &str, domain: &str) -> anyhow::Result<()> {
+        let (name, domain) = (name.to_string(), domain.to_string());
+        self.call(move |conn| conn.execute("DELETE FROM nip05 WHERE name = ? AND domain = ?", [name, domain])).await?;
+        Ok(())
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }

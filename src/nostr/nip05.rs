@@ -3,15 +3,19 @@
 //!
 //! Every file apt or dnf fetches names its repository's owner, so lookups are
 //! cached for as long as a repository is, and a domain that stops answering
-//! keeps resolving to the key it last gave.
+//! keeps resolving to the key it last gave. That key is kept in the database,
+//! so it outlasts a restart too.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::time::Instant;
 
 use super::is_hex64;
+use crate::db::Db;
 
 /// The largest `nostr.json` read. Real ones list a few names; some list
 /// thousands, but a lookup with `?name=` should get one.
@@ -65,19 +69,33 @@ pub enum LookupError {
 
 #[derive(Default)]
 struct Entry {
+    /// Whether `good` has been read from the database yet.
+    loaded: bool,
+    /// The key, and when to look it up again.
     good: Option<(Instant, String)>,
     failed: Option<(Instant, LookupError)>,
+}
+
+#[derive(Default)]
+struct Slot {
+    /// Held across a lookup nothing is known for yet, so the requests that
+    /// arrive meanwhile (apt asks for several files at once) share it.
+    entry: tokio::sync::Mutex<Entry>,
+    refreshing: AtomicBool,
 }
 
 pub struct Resolver {
     http: reqwest::Client,
     ttl: Duration,
+    db: Db,
+    /// Where every domain's `nostr.json` is fetched from instead, in tests.
+    origin: Option<String>,
     /// Never held across an await.
-    cache: std::sync::Mutex<HashMap<Address, Entry>>,
+    slots: std::sync::Mutex<HashMap<Address, Arc<Slot>>>,
 }
 
 impl Resolver {
-    pub fn new(ttl: Duration) -> anyhow::Result<Resolver> {
+    pub fn new(ttl: Duration, db: Db) -> anyhow::Result<Arc<Resolver>> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(5))
@@ -85,47 +103,70 @@ impl Resolver {
             // NIP-05: fetchers must ignore redirects.
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Resolver { http, ttl, cache: Default::default() })
+        Ok(Arc::new(Resolver { http, ttl, db, origin: None, slots: Default::default() }))
     }
 
-    /// The hex pubkey `address` names.
-    pub async fn resolve(&self, address: &Address) -> Result<String, LookupError> {
-        let stale = {
-            let cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let entry = cache.get(address);
-            let good = entry.and_then(|entry| entry.good.clone());
-            if let Some((at, pubkey)) = &good
-                && at.elapsed() < self.ttl
-            {
-                return Ok(pubkey.clone());
+    /// The hex pubkey `address` names. Only an address with no key known
+    /// waits on its domain; a key past `ttl` is given while it's looked up
+    /// again in the background.
+    pub async fn resolve(self: &Arc<Self>, address: &Address) -> Result<String, LookupError> {
+        let slot = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(address.clone()).or_default().clone();
+        let mut entry = slot.entry.lock().await;
+        if !entry.loaded {
+            match self.db.nip05(&address.name, &address.domain).await {
+                Ok(row) => {
+                    entry.good = row.map(|(pubkey, age)| (Instant::now() + self.ttl.saturating_sub(age), pubkey));
+                }
+                Err(error) => tracing::warn!(%address, ?error, "couldn't read a stored NIP-05 key"),
             }
-            if let Some((at, error)) = entry.and_then(|entry| entry.failed.as_ref())
-                && at.elapsed() < FAILURE_TTL
-            {
-                return good.map(|(_, pubkey)| pubkey).ok_or_else(|| error.clone());
+            entry.loaded = true;
+        }
+        let cooling = entry.failed.as_ref().filter(|(at, _)| at.elapsed() < FAILURE_TTL).map(|(_, error)| error.clone());
+
+        if let Some((refresh_at, pubkey)) = &entry.good {
+            // A domain that just failed isn't asked again on every request.
+            if Instant::now() >= *refresh_at && cooling.is_none() && !slot.refreshing.swap(true, Ordering::AcqRel) {
+                let (resolver, slot, address) = (self.clone(), slot.clone(), address.clone());
+                tokio::spawn(async move {
+                    let result = resolver.lookup(&address).await;
+                    resolver.record(&mut *slot.entry.lock().await, &address, &result).await;
+                    slot.refreshing.store(false, Ordering::Release);
+                });
             }
-            good.map(|(_, pubkey)| pubkey)
-        };
+            return Ok(pubkey.clone());
+        }
+        if let Some(error) = cooling {
+            return Err(error);
+        }
 
         let result = self.lookup(address).await;
-        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = cache.entry(address.clone()).or_default();
-        match result {
+        self.record(&mut entry, address, &result).await;
+        result
+    }
+
+    /// Remember what a lookup found, here and in the database.
+    async fn record(&self, entry: &mut Entry, address: &Address, result: &Result<String, LookupError>) {
+        let stored = match result {
             Ok(pubkey) => {
-                *entry = Entry { good: Some((Instant::now(), pubkey.clone())), failed: None };
-                Ok(pubkey)
+                entry.good = Some((Instant::now() + self.ttl, pubkey.clone()));
+                entry.failed = None;
+                self.db.store_nip05(&address.name, &address.domain, pubkey).await
             }
             // The domain says the name is gone: believe it.
             Err(error @ LookupError::NotFound(_)) => {
-                *entry = Entry { good: None, failed: Some((Instant::now(), error.clone())) };
-                Err(error)
+                entry.good = None;
+                entry.failed = Some((Instant::now(), error.clone()));
+                self.db.forget_nip05(&address.name, &address.domain).await
             }
             // The domain is down: the key it last gave stands.
             Err(error) => {
                 tracing::warn!(%address, ?error, "NIP-05 lookup failed");
                 entry.failed = Some((Instant::now(), error.clone()));
-                stale.ok_or(error)
+                Ok(())
             }
+        };
+        if let Err(error) = stored {
+            tracing::warn!(%address, ?error, "couldn't store a NIP-05 lookup");
         }
     }
 
@@ -133,7 +174,8 @@ impl Resolver {
         let Address { name, domain } = address;
         let failed = |why: String| LookupError::Failed(format!("Couldn't look up {address}: {why}. Try again later."));
         // `parse` only lets through characters that need no escaping.
-        let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
+        let origin = self.origin.clone().unwrap_or_else(|| format!("https://{domain}"));
+        let url = format!("{origin}/.well-known/nostr.json?name={name}");
         let mut response = self.http.get(&url).send().await.map_err(|error| failed(format!("{domain} didn't answer ({error})")))?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -220,5 +262,119 @@ mod tests {
         assert!(matches!(pubkey_in(body.as_bytes(), "bad"), Err(Some(_))));
         assert!(matches!(pubkey_in(b"<html>", "_"), Err(Some(_))));
         assert!(matches!(pubkey_in(b"{}", "_"), Err(Some(_))));
+    }
+
+    /// A `nostr.json` server whose answer can be changed, and that counts
+    /// how often it's asked.
+    struct Domain {
+        origin: String,
+        names: Arc<std::sync::Mutex<Value>>,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Domain {
+        async fn start(delay: Duration) -> Domain {
+            let names = Arc::new(std::sync::Mutex::new(serde_json::json!({})));
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (served, counted) = (names.clone(), hits.clone());
+            let app = axum::Router::new().route(
+                "/.well-known/nostr.json",
+                axum::routing::get(move || async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let names = served.lock().unwrap().clone();
+                    serde_json::json!({ "names": names }).to_string()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            Domain { origin, names, hits }
+        }
+
+        fn names(&self, names: Value) {
+            *self.names.lock().unwrap() = names;
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    fn resolver(ttl: Duration, db: &Db, origin: &str) -> Arc<Resolver> {
+        let mut resolver = Resolver::new(ttl, db.clone()).unwrap();
+        Arc::get_mut(&mut resolver).unwrap().origin = Some(origin.to_string());
+        resolver
+    }
+
+    fn key(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// Wait for a background lookup to leave the database as `want`.
+    async fn stored(db: &Db, want: Option<String>) {
+        for _ in 0..500 {
+            if db.nip05("alex", "example.com").await.unwrap().map(|(pubkey, _)| pubkey) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the database never held {want:?}");
+    }
+
+    #[tokio::test]
+    async fn keeps_the_last_key_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let address = Address::parse("alex@example.com").unwrap();
+        let domain = Domain::start(Duration::ZERO).await;
+        domain.names(serde_json::json!({ "alex": key('a') }));
+        let db = Db::open(&path).unwrap();
+        assert_eq!(resolver(Duration::from_secs(300), &db, &domain.origin).resolve(&address).await.unwrap(), key('a'));
+        drop(db);
+
+        // Nothing answers there.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(resolver(Duration::from_secs(300), &db, "http://127.0.0.1:9").resolve(&address).await.unwrap(), key('a'));
+        // Nor once the key is past its ttl: it's the last one given.
+        assert_eq!(resolver(Duration::ZERO, &db, "http://127.0.0.1:9").resolve(&address).await.unwrap(), key('a'));
+    }
+
+    #[tokio::test]
+    async fn gives_an_old_key_while_looking_it_up_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let address = Address::parse("alex@example.com").unwrap();
+        let domain = Domain::start(Duration::ZERO).await;
+        let resolver = resolver(Duration::ZERO, &db, &domain.origin);
+
+        domain.names(serde_json::json!({ "alex": key('a') }));
+        assert_eq!(resolver.resolve(&address).await.unwrap(), key('a'));
+        domain.names(serde_json::json!({ "alex": key('b') }));
+        assert_eq!(resolver.resolve(&address).await.unwrap(), key('a'));
+        stored(&db, Some(key('b'))).await;
+
+        // The domain says the name is gone: so it is, here and stored.
+        domain.names(serde_json::json!({}));
+        assert_eq!(resolver.resolve(&address).await.unwrap(), key('b'));
+        stored(&db, None).await;
+        while resolver.slots.lock().unwrap()[&address].refreshing.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(resolver.resolve(&address).await, Err(LookupError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn looks_up_an_unknown_address_once_for_everyone_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let address = Address::parse("alex@example.com").unwrap();
+        let domain = Domain::start(Duration::from_millis(200)).await;
+        domain.names(serde_json::json!({ "alex": key('a') }));
+        let resolver = resolver(Duration::from_secs(300), &db, &domain.origin);
+
+        let (first, second, third) = tokio::join!(resolver.resolve(&address), resolver.resolve(&address), resolver.resolve(&address));
+        assert_eq!([first.unwrap(), second.unwrap(), third.unwrap()], [key('a'), key('a'), key('a')]);
+        assert_eq!(domain.hits(), 1);
     }
 }

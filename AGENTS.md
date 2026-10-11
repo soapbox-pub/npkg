@@ -19,13 +19,13 @@ src/
   repo.rs        building a repository: fetch, inspect, select, pin, render;
                  cached in memory and rebuilt in the background
   nip82.rs       application, release and asset events, fetched from relays
-  nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (cached),
-                 one-shot relay queries
+  nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (stored,
+                 and refreshed in the background), one-shot relay queries
   inspect/       reading a .deb's control file and an .rpm's header
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
   signing.rs     the gateway's Ed25519 OpenPGP key
-  db.rs          SQLite: inspected package files, and pins
+  db.rs          SQLite: inspected package files, pins, NIP-05 keys
 tests/fixtures/  tiny real packages nfpm built (see its README)
 ```
 
