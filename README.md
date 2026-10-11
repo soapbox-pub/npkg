@@ -228,4 +228,12 @@ downloads are redirects to Blossom. A `.flatpak` is unpacked into
 disk: about one copy of each app, plus what changed in each release.
 
 `keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
-as root) once. Back it up: every user's setup trusts that key.
+as root) once, readable only by its owner; the gateway refuses to start if
+anyone else can read it. Back it up: every user's setup trusts that key.
+
+Put a reverse proxy in front, on the same machine, terminating TLS and
+setting `X-Forwarded-For`. The gateway itself has no timeouts or limits on
+connections, which the proxy should bring. Serve users over https:
+`InRelease`, `repomd.xml` and Flatpak summaries don't expire, so over plain
+http whoever is on the path could keep handing out old ones. The gateway
+warns at startup if `public_url` is http.

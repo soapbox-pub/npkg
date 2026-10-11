@@ -28,6 +28,14 @@ pub struct Signer {
 
 impl Signer {
     pub fn load(path: &Path) -> anyhow::Result<Signer> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).map(|metadata| metadata.permissions().mode()).unwrap_or(0o600);
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "The signing key at {} can be read by others (mode {:o}): whoever reads it can sign for every repository. Make it 0600 with `chmod 600`.",
+            path.display(),
+            mode & 0o777
+        );
         let armored = std::fs::read_to_string(path)
             .with_context(|| format!("Couldn't read the signing key at {}. Make one with `npkg-gateway keygen`.", path.display()))?;
         let (key, _) = SignedSecretKey::from_string(&armored).context("The signing key isn't an armored OpenPGP secret key.")?;
@@ -105,6 +113,10 @@ mod tests {
         assert!(Signer::generate(&path, "again").is_err(), "an existing key is never replaced");
         let signer2 = Signer::load(&path).unwrap();
         assert_eq!(signer.fingerprint(), signer2.fingerprint());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Signer::load(&path).is_err(), "a key others can read is refused");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let (public, _) = SignedPublicKey::from_string(signer.public_key()).unwrap();
 

@@ -66,7 +66,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/releases/{owner}/{d}/latest/download/{name}", get(latest_download))
         .route("/releases/{owner}/{d}/tags/{version}", get(tagged_release))
         .route("/releases/{owner}/{d}/download/{version}/{name}", get(tagged_download))
+        .layer(axum::middleware::map_response(nosniff))
         .with_state(state)
+}
+
+/// Every response is what its content type says: a browser shouldn't guess
+/// that an author's text, say, is HTML.
+async fn nosniff(mut response: Response) -> Response {
+    response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    response
 }
 
 /// An error a person reads: plain text, a sentence.

@@ -93,6 +93,11 @@ async fn main() -> anyhow::Result<()> {
             let bind = config.bind;
             let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("Couldn't listen on {bind}."))?;
             tracing::info!(%bind, public_url, config = %config.source.display(), "listening");
+            if public_url.starts_with("http://") {
+                // Signed indexes never expire, so whoever sits on the
+                // connection could hold users on old ones, unseen.
+                tracing::warn!(public_url, "public_url is plain http: fine for testing, but serve users over https");
+            }
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
