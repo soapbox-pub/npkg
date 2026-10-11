@@ -1,14 +1,15 @@
 # npkg-gateway
 
-apt and dnf repositories for software a team releases on Nostr.
+apt, dnf and Flatpak repositories for software a team releases on Nostr.
 
 The gateway follows the NIP-82 events of the authors its operator lists, and
 every application they publish gets its own repository, addressed by its
 author and its `d` tag:
 
 ```
-/apt/<owner>/<d>     # Debian, Ubuntu
-/rpm/<owner>/<d>     # Fedora, RHEL, Rocky
+/apt/<owner>/<d>       # Debian, Ubuntu
+/rpm/<owner>/<d>       # Fedora, RHEL, Rocky
+/flatpak/<owner>/<d>   # any Linux, through Flatpak
 ```
 
 The owner is the author's npub, or a NIP-05 address that names them:
@@ -28,6 +29,12 @@ sudo apt update && sudo apt install npanel
 sudo curl -fsSL -o /etc/yum.repos.d/npanel.repo \
   https://<host>/rpm/npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj/npanel/repo
 sudo dnf install npanel
+```
+
+```sh
+# Flatpak
+flatpak install --user \
+  https://<host>/flatpak/soapbox.pub/buzz.armada.app/buzz.armada.app.flatpakref
 ```
 
 Add `?channel=beta` (or `nightly`, `dev`) to a setup URL to follow a
@@ -115,15 +122,36 @@ asset's tags.
 - A file listed by more than one release is served once, in the most stable
   of their channels.
 
+## Flatpak
+
+A release's `.flatpak` bundles (`application/vnd.flatpak` assets) are
+unpacked into an OSTree repository, so the app can be installed and updated
+with `flatpak` like any other remote's: an update fetches only the files
+that changed, `flatpak repair` and `flatpak update --commit=` work, and the
+bundle is checked, object by object, before anyone installs it.
+
+Each channel is a remote of its own, at `/flatpak/<owner>/<d>/<channel>/`,
+holding the newest commit of each app on it: the one from the release
+`/releases/…/latest` would pick, for each architecture. A `.flatpakref`
+(`/flatpak/<owner>/<d>/<anything>.flatpakref`, with `?channel=`) installs
+the app and adds the remote; a `.flatpakrepo` only adds the remote. The
+runtime an app needs comes from Flathub, which the `.flatpakref` names.
+
+Every commit any release lists is kept, so downgrades work; objects nothing
+needs any more are pruned once a day. The repositories don't carry
+AppStream data yet, so GNOME Software and Discover don't list their apps,
+though they install a `.flatpakref` fine.
+
 The channels are `stable`, `beta`, `nightly` and `dev`: an apt suite or a
 dnf repository each. Each one includes every more stable channel, so `beta`
 has the stable releases too. `stable` holds the releases NIP-82 tags `main`.
 
 ## Trust
 
-apt and dnf can't check Nostr signatures. The gateway checks each event's
-signature and each file's sha256, and then signs the repository metadata
-(`InRelease`, `repomd.xml`) with its own Ed25519 OpenPGP key. Users who add a
+apt, dnf and Flatpak can't check Nostr signatures. The gateway checks each
+event's signature and each file's sha256, and then signs the repository
+metadata (`InRelease`, `repomd.xml`, a Flatpak remote's summary and
+commits) with its own Ed25519 OpenPGP key. Users who add a
 repository are trusting the gateway to have done that, and the author as
 much as any third-party repository: the author can publish any package,
 under any name. Package downloads are redirects to Blossom: apt and dnf
@@ -169,9 +197,11 @@ on the team, are required; `npkg-gateway.example.toml` lists every setting
 default. An author taken off the list has their events forgotten at the next
 start.
 
-The first start downloads every `.deb` and `.rpm` the team has released, once,
-to read what each one is. Only what it reads is kept: package downloads are
-redirects to Blossom.
+The first start downloads every `.deb`, `.rpm` and `.flatpak` the team has
+released, once. Of a `.deb` or `.rpm`, only what it is is kept: package
+downloads are redirects to Blossom. A `.flatpak` is unpacked into
+`data_dir/ostree`, which Flatpak remotes are served from, and that takes
+disk: about one copy of each app, plus what changed in each release.
 
 `keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
 as root) once. Back it up: every user's setup trusts that key.

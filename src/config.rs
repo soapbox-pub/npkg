@@ -34,7 +34,7 @@ pub struct Config {
     /// The URL users reach the gateway at, for the setup files. No trailing
     /// slash.
     pub public_url: String,
-    /// Directory holding the database and the signing key.
+    /// Directory holding the database, the signing key, and the OSTree store.
     pub data_dir: PathBuf,
     /// Relays to look for NIP-82 events on.
     pub relays: Vec<String>,
@@ -196,6 +196,11 @@ impl Config {
     /// Path of the SQLite database file.
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("npkg-gateway.sqlite")
+    }
+
+    /// Directory of the OSTree object store Flatpak remotes are served from.
+    pub fn ostree_path(&self) -> PathBuf {
+        self.data_dir.join("ostree")
     }
 
     /// Path of the gateway's OpenPGP signing key.

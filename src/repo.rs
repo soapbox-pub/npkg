@@ -3,7 +3,8 @@
 //!
 //! A repository serves every .deb and .rpm its application's releases list,
 //! under whatever names the files give themselves, the way a PPA serves
-//! whatever its owner uploads. The release is only how a file is found: what
+//! whatever its owner uploads, and every Flatpak app its `.flatpak` bundles
+//! carry, unpacked into the gateway's OSTree store. The release is only how a file is found: what
 //! a package is, is what the file says. Adding a repository trusts its author
 //! as much as adding any third-party repository does.
 //!
@@ -24,6 +25,8 @@ use crate::db::{Db, Inspected};
 use crate::inspect::{self, Format, Meta};
 use crate::nip82::{self, Asset};
 use crate::nostr::nip19;
+use crate::ostree::delta::{self, Bundle};
+use crate::ostree::{Kind, Store, summary};
 use crate::signing::Signer;
 use crate::{apt, rpmmd};
 
@@ -73,6 +76,24 @@ pub struct Rejection {
     pub reason: String,
 }
 
+/// A Flatpak bundle a release listed, and the commit it carried.
+#[derive(Clone, Debug)]
+pub struct FlatpakBundle {
+    /// The version of the NIP-82 release it came from.
+    pub release: String,
+    pub created_at: i64,
+    pub sha256: String,
+    pub bundle: Bundle,
+}
+
+/// One channel's Flatpak remote: the newest commit of each ref, and the
+/// signed summary that says so.
+pub struct FlatpakChannel {
+    pub refs: Vec<FlatpakBundle>,
+    summary: Vec<u8>,
+    summary_sig: Vec<u8>,
+}
+
 /// A NIP-82 release, as the gateway lists it for downloading its files
 /// directly.
 #[derive(Clone, Debug)]
@@ -100,6 +121,12 @@ pub struct Repo {
     apt: HashMap<String, HashMap<String, Vec<u8>>>,
     /// By channel, then by path below it.
     rpm: HashMap<usize, HashMap<String, Vec<u8>>>,
+    /// Every bundle the releases list that unpacked, oldest first.
+    pub bundles: Vec<FlatpakBundle>,
+    /// By channel, for each channel some release has a bundle on.
+    flatpak: HashMap<usize, FlatpakChannel>,
+    /// The signature of each of `bundles`' commits, as a `.commitmeta`.
+    commitmeta: HashMap<String, Vec<u8>>,
     /// What it was built from.
     pub snapshot: nip82::Snapshot,
     /// Whether a file was left out for a reason that might not hold next
@@ -114,6 +141,27 @@ impl Repo {
 
     pub fn rpm_file(&self, channel: usize, path: &str) -> Option<&[u8]> {
         self.rpm.get(&channel)?.get(path).map(Vec::as_slice)
+    }
+
+    /// The Flatpak remote of the channel ranked `rank`, if any release on it
+    /// or a more stable one has a bundle.
+    pub fn flatpak(&self, rank: usize) -> Option<&FlatpakChannel> {
+        self.flatpak.get(&rank)
+    }
+
+    /// A file at the top of a channel's Flatpak remote.
+    pub fn flatpak_file(&self, rank: usize, name: &str) -> Option<&[u8]> {
+        let channel = self.flatpak.get(&rank)?;
+        match name {
+            "summary" => Some(&channel.summary),
+            "summary.sig" => Some(&channel.summary_sig),
+            _ => None,
+        }
+    }
+
+    /// The signature of one of the repository's commits.
+    pub fn commitmeta(&self, commit: &str) -> Option<&[u8]> {
+        self.commitmeta.get(commit).map(Vec::as_slice)
     }
 
     /// Where to download the file with this hash, if it's one of this
@@ -157,6 +205,7 @@ pub struct Repos {
     /// Blossom servers to look for a package file on, after its own URL.
     blossom: Vec<String>,
     db: Db,
+    store: Store,
     http: reqwest::Client,
     signer: Arc<Signer>,
     /// By author and `d`. Never held across an await.
@@ -165,18 +214,22 @@ pub struct Repos {
 }
 
 impl Repos {
-    pub fn new(blossom: Vec<String>, db: Db, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
+    pub fn new(blossom: Vec<String>, db: Db, store: Store, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
-        Ok(Arc::new(Repos { blossom, db, http, signer, built: Default::default(), synced: AtomicBool::new(false) }))
+        Ok(Arc::new(Repos { blossom, db, store, http, signer, built: Default::default(), synced: AtomicBool::new(false) }))
     }
 
     pub fn signer(&self) -> &Signer {
         &self.signer
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// The repository for `pubkey`'s application `d`.
@@ -220,6 +273,7 @@ impl Repos {
         let started = Instant::now();
         let mut rejections = Vec::new();
         let mut wanted = Vec::new();
+        let mut wanted_bundles = Vec::new();
         let mut releases = Vec::new();
         for release in &snapshot.releases {
             let Some(channel) = RELEASE_CHANNELS.iter().position(|channel| *channel == release.channel) else {
@@ -237,6 +291,8 @@ impl Repos {
             for asset in &release.assets {
                 if let Some(format) = Format::from_mime(&asset.mime) {
                     wanted.push((release.clone(), channel, asset.clone(), format));
+                } else if asset.mime == nip82::FLATPAK_MIME {
+                    wanted_bundles.push((release.clone(), asset.clone()));
                 }
             }
             let assets = release
@@ -261,6 +317,7 @@ impl Repos {
         }
         sort_releases(&mut releases);
         wanted.truncate(MAX_CANDIDATES);
+        wanted_bundles.truncate(MAX_CANDIDATES);
 
         let inspected: Vec<_> = futures_util::stream::iter(wanted)
             .map(|(release, channel, asset, format)| async move {
@@ -292,6 +349,33 @@ impl Repos {
                 }
             }
         }
+
+        let unpacked: Vec<_> = futures_util::stream::iter(wanted_bundles)
+            .map(|(release, asset)| async move {
+                let result = self.unpacked(&asset, offline).await;
+                (release, asset, result)
+            })
+            .buffer_unordered(DOWNLOADS)
+            .collect()
+            .await;
+        let mut bundles = Vec::new();
+        for (release, asset, result) in unpacked {
+            let reject = |reason: String| Rejection { release: release.version.clone(), sha256: asset.sha256.clone(), reason };
+            match result {
+                Ok(Ok(bundle)) => bundles.push(FlatpakBundle {
+                    release: release.version.clone(),
+                    created_at: release.created_at,
+                    sha256: asset.sha256.clone(),
+                    bundle,
+                }),
+                Ok(Err(error)) => rejections.push(reject(error)),
+                Err(error) => {
+                    incomplete = true;
+                    rejections.push(reject(format!("{error:#}")));
+                }
+            }
+        }
+        bundles.sort_by(|a, b| (a.created_at, &a.sha256).cmp(&(b.created_at, &b.sha256)));
 
         let (candidates, rejected) = select(candidates);
         rejections.extend(rejected);
@@ -341,15 +425,45 @@ impl Repos {
         let signer = self.signer.clone();
         let description = format!("{name}, published on Nostr by {}", nip19::npub_encode(pubkey));
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
+        let store = self.store.clone();
         let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<Repo> {
             let mut apt = HashMap::new();
             let mut rpm = HashMap::new();
+            let mut flatpak = HashMap::new();
             for (rank, channel) in CHANNELS.iter().enumerate() {
                 let included: Vec<&Package> = packages.iter().filter(|package| package.channel <= rank).collect();
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
+                let refs = flatpak_heads(&releases, &bundles, rank);
+                if !refs.is_empty() {
+                    let summary = summary::render(&refs.iter().map(|head| &head.bundle).collect::<Vec<_>>());
+                    let summary_sig = summary::signatures(&signer, &summary)?;
+                    flatpak.insert(rank, FlatpakChannel { refs, summary, summary_sig });
+                }
             }
-            Ok(Repo { pubkey, d, name, summary, packages, rejections, releases, apt, rpm, snapshot, incomplete })
+            let mut commitmeta = HashMap::new();
+            for bundle in &bundles {
+                let commit = &bundle.bundle.commit;
+                if !commitmeta.contains_key(commit) {
+                    commitmeta.insert(commit.clone(), summary::signatures(&signer, &store.read(Kind::Commit, commit)?)?);
+                }
+            }
+            Ok(Repo {
+                pubkey,
+                d,
+                name,
+                summary,
+                packages,
+                rejections,
+                releases,
+                apt,
+                rpm,
+                bundles,
+                flatpak,
+                commitmeta,
+                snapshot,
+                incomplete,
+            })
         })
         .await??;
 
@@ -357,6 +471,7 @@ impl Repos {
             pubkey = repo.pubkey,
             d = repo.d,
             packages = repo.packages.len(),
+            bundles = repo.bundles.len(),
             rejected = repo.rejections.len(),
             ms = started.elapsed().as_millis() as u64,
             offline,
@@ -399,6 +514,68 @@ impl Repos {
         Err(last_error.context(format!("Couldn't download the {} {}", format.as_str(), asset.sha256)))
     }
 
+    /// The commit the Flatpak bundle `asset` names carried, from the
+    /// database, or by downloading the bundle and unpacking it into the
+    /// store. The bundle itself isn't kept. Errors are as [`Self::inspected`]
+    /// has them.
+    async fn unpacked(&self, asset: &Asset, offline: bool) -> anyhow::Result<Result<Bundle, String>> {
+        match self.db.bundle(&asset.sha256).await? {
+            // Pruning took its objects once no release listed it.
+            Some(Ok(bundle)) if !self.store.has(Kind::Commit, &bundle.commit) => {}
+            Some(known) => return Ok(known),
+            None => {}
+        }
+        anyhow::ensure!(!offline, "The bundle isn't unpacked yet. It will be tried again when the repository is next refreshed.");
+
+        let mut urls: Vec<String> = asset.url.iter().filter(|url| url.starts_with("https://")).cloned().collect();
+        urls.extend(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
+
+        let mut last_error = anyhow::anyhow!("The asset has no https URL, and no Blossom server is configured.");
+        for url in urls {
+            let file = match self.download_to_file(&url, &asset.sha256).await {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::debug!(url, %error, "download failed");
+                    last_error = error;
+                    continue;
+                }
+            };
+            let store = self.store.clone();
+            let bundle =
+                tokio::task::spawn_blocking(move || delta::unpack(file.path(), &store)).await?.map_err(|error| format!("{error:#}"));
+            self.db.store_bundle(&asset.sha256, &bundle).await?;
+            return Ok(bundle);
+        }
+        Err(last_error.context(format!("Couldn't download the bundle {}", asset.sha256)))
+    }
+
+    /// Download `url` into a temporary file in the store, checking it's the
+    /// file with hash `sha256`. Bundles are too big to hold in memory.
+    async fn download_to_file(&self, url: &str, sha256: &str) -> anyhow::Result<tempfile::NamedTempFile> {
+        use tokio::io::AsyncWriteExt;
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        if response.content_length().is_some_and(|length| length > MAX_PACKAGE) {
+            anyhow::bail!("{url} is larger than {MAX_PACKAGE} bytes.");
+        }
+        let file = tempfile::NamedTempFile::new_in(self.store.tmp())?;
+        let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(file.reopen()?));
+        let mut stream = response.bytes_stream();
+        let (mut hasher, mut size) = (Sha256::new(), 0u64);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            size += chunk.len() as u64;
+            if size > MAX_PACKAGE {
+                anyhow::bail!("{url} is larger than {MAX_PACKAGE} bytes.");
+            }
+            hasher.update(&chunk);
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        let actual = hex::encode(hasher.finalize());
+        anyhow::ensure!(actual == sha256, "{url} served a file whose sha256 is {actual}, not {sha256}.");
+        Ok(file)
+    }
+
     async fn download(&self, url: &str, sha256: &str) -> anyhow::Result<Vec<u8>> {
         let response = self.http.get(url).send().await?.error_for_status()?;
         if response.content_length().is_some_and(|length| length > MAX_PACKAGE) {
@@ -416,6 +593,22 @@ impl Repos {
         anyhow::ensure!(actual == sha256, "{url} served a file whose sha256 is {actual}, not {sha256}.");
         Ok(bytes)
     }
+}
+
+/// The bundle each ref's newest commit came from, on the channel ranked
+/// `rank`: from the release [`latest`] would pick, or else the next one down
+/// that has a bundle for it, so an app is still there when the latest
+/// release only shipped another architecture.
+fn flatpak_heads(releases: &[Release], bundles: &[FlatpakBundle], rank: usize) -> Vec<FlatpakBundle> {
+    let mut heads: Vec<FlatpakBundle> = Vec::new();
+    for release in releases.iter().filter(|release| release.channel <= rank && (rank > 0 || !nip82::is_prerelease(&release.version))) {
+        for bundle in bundles.iter().filter(|bundle| bundle.release == release.version && bundle.created_at == release.created_at) {
+            if !heads.iter().any(|head| head.bundle.ref_name == bundle.bundle.ref_name) {
+                heads.push(bundle.clone());
+            }
+        }
+    }
+    heads
 }
 
 /// A package version, as apt and dnf tell one from another: name, version
@@ -603,7 +796,56 @@ mod tests {
     pub fn repos(dir: &std::path::Path, db: &Db) -> Arc<Repos> {
         let key = dir.join(format!("key-{}.asc", rand::random::<u32>()));
         let signer = Arc::new(Signer::generate(&key, "test").unwrap());
-        Repos::new(Vec::new(), db.clone(), signer).unwrap()
+        let store = Store::open(&dir.join("ostree")).unwrap();
+        Repos::new(Vec::new(), db.clone(), store, signer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_the_newest_bundle_on_each_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let repos = repos(dir.path(), &db);
+        let fixture = include_bytes!("../tests/fixtures/hello.flatpak");
+        let path = dir.path().join("hello.flatpak");
+        std::fs::write(&path, fixture).unwrap();
+        let bundle = delta::unpack(&path, repos.store()).unwrap();
+        let sha256 = hex::encode(Sha256::digest(fixture));
+        db.store_bundle(&sha256, &Ok(bundle.clone())).await.unwrap();
+
+        let asset = |sha256: &str| Asset {
+            mime: nip82::FLATPAK_MIME.into(),
+            sha256: sha256.into(),
+            url: None,
+            filename: None,
+            size: None,
+            platforms: Vec::new(),
+        };
+        let release = |version: &str, channel: &str, created_at, assets| nip82::Release {
+            version: version.into(),
+            channel: channel.into(),
+            created_at,
+            notes: String::new(),
+            assets,
+        };
+        let snapshot = nip82::Snapshot {
+            application: None,
+            releases: vec![
+                release("1.0.0", "main", 100, vec![asset(&sha256)]),
+                release("2.0.0-beta.1", "beta", 200, vec![asset(&sha256)]),
+                // Newer, but its bundle was never unpacked.
+                release("2.0.0-beta.2", "beta", 300, vec![asset(&"d".repeat(64))]),
+            ],
+        };
+        let repo = repos.build("pk", "hello", &snapshot, true).await.unwrap();
+        assert_eq!(repo.bundles.len(), 2);
+        assert!(repo.incomplete);
+        let head = |rank| repo.flatpak(rank).unwrap().refs.iter().map(|head| head.release.as_str()).collect::<Vec<_>>();
+        assert_eq!(head(0), ["1.0.0"]);
+        assert_eq!(head(1), ["2.0.0-beta.1"]);
+        assert_eq!(head(3), ["2.0.0-beta.1"]);
+        assert!(repo.flatpak_file(0, "summary").is_some() && repo.flatpak_file(0, "summary.sig").is_some());
+        assert!(repo.commitmeta(&bundle.commit).is_some());
+        assert!(repo.flatpak_file(0, "config").is_none());
     }
 
     #[tokio::test]

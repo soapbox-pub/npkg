@@ -16,6 +16,7 @@ pub const KINDS: [i64; 3] = [APPLICATION, RELEASE, ASSET];
 
 pub const DEB_MIME: &str = "application/vnd.debian.binary-package";
 pub const RPM_MIME: &str = "application/x-rpm";
+pub const FLATPAK_MIME: &str = "application/vnd.flatpak";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Application {

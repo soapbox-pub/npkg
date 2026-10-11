@@ -8,10 +8,12 @@
 mod apt;
 mod config;
 mod db;
+mod gvariant;
 mod http;
 mod inspect;
 mod nip82;
 mod nostr;
+mod ostree;
 mod rate_limit;
 mod repo;
 mod rpmmd;
@@ -73,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
             let signer = Arc::new(signing::Signer::load(&key_path)?);
             let db = db::Db::open(&config.database_path())?;
             let names = nostr::nip05::Resolver::new(db.clone(), config.authors.clone())?;
-            let repos = repo::Repos::new(config.blossom_servers.clone(), db.clone(), signer)?;
+            let store = ostree::Store::open(&config.ostree_path())?;
+            let repos = repo::Repos::new(config.blossom_servers.clone(), db.clone(), store, signer)?;
             sync::Worker {
                 relays: config.relays.clone(),
                 authors: config.authors.clone(),

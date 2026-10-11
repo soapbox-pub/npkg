@@ -1,11 +1,14 @@
 # npkg-gateway
 
-apt and dnf repositories for software a team releases on Nostr (NIP-82).
+apt, dnf and Flatpak repositories for software a team releases on Nostr
+(NIP-82).
 The gateway follows the NIP-82 events of the authors its config lists, and
 each application they publish gets a repository, at `/apt/<owner>/<d>` and
 `/rpm/<owner>/<d>`, that serves every package its releases list, under any
-name. The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
-`soapbox.pub` for `_@soapbox.pub`). See README.md for what's left out.
+name, and an OSTree remote per channel at `/flatpak/<owner>/<d>/<channel>/`
+for the Flatpak bundles they list. The owner is an npub or a NIP-05 address
+(`alex@gleasonator.com`, or `soapbox.pub` for `_@soapbox.pub`). See
+README.md for what's left out.
 
 This is a spike: kept simple on purpose, and revised as we go. Nothing is
 deployed yet, so there's no backwards compatibility to keep.
@@ -30,10 +33,13 @@ src/
   inspect/       reading a .deb's control file and an .rpm's header
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
+  ostree/        Flatpak: unpacking bundles (delta.rs) into an archive-z2
+                 object store, pruning it, and summaries (summary.rs)
+  gvariant.rs    GLib's serialization, which OSTree's formats are made of
   signing.rs     the gateway's Ed25519 OpenPGP key
-  db.rs          SQLite: the team's events, inspected package files, pins,
-                 NIP-05 keys
-tests/fixtures/  tiny real packages nfpm built (see its README)
+  db.rs          SQLite: the team's events, inspected package files,
+                 unpacked bundles, pins, NIP-05 keys
+tests/fixtures/  tiny real packages nfpm and flatpak built (see its README)
 ```
 
 ## How a build goes
@@ -62,12 +68,21 @@ one up.
    its metadata, and store that in SQLite by hash. A file's hash never
    changes, so this happens once per file. The file itself isn't kept:
    downloads are redirects.
+   A .flatpak is downloaded to a temporary file and unpacked into the
+   OSTree store instead, every object checked against its checksum; the
+   commit it carried is stored in SQLite by the bundle's hash, and the
+   bundle deleted.
 3. Select the files an index can hold, each once, then pin: the first file
    for a package version (name, version, architecture, as the file says) is
    the one served from then on.
 4. Render and sign every channel. Indexes are dated by their newest release,
    not by the build, so rebuilding the same packages gives the same files
    and a client between two requests never sees hashes change underneath it.
+   A channel's Flatpak summary names the newest commit of each ref, and is
+   dated by it.
+
+Once a day, after a resync, the sync worker prunes the OSTree store of
+objects no current release's commit reaches, if they're over a day old.
 
 ## Conventions
 
@@ -111,6 +126,13 @@ podman run --rm --network host docker.io/library/rockylinux:8 bash -c "
 This was last done against npanel 0.6.0 on debian:trixie, ubuntu:24.04,
 fedora:latest and rockylinux:8, and against npanel 0.6.1 on debian:trixie
 and rockylinux:8 from a gateway restarted with its relays unreachable.
+
+For Flatpak, `flatpak install --user --no-deps --from <.flatpakref>` in a
+fedora:latest container (with `--network host`, and `flatpak` installed) was
+checked against Armada 0.64.7-0.64.11: install, `update --commit=` to an
+older commit and back, `repair` after deleting an object, and an install
+from a gateway restarted with its relays unreachable. An `ostree pull` from
+0.64.7 to 0.64.11 fetched 9 objects (6 MB) of 599.
 
 ## Committing
 

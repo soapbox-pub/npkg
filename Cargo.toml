@@ -16,6 +16,8 @@ hex = "0.4.3"
 # The xz and zstd a .deb's control archive may be compressed with, in pure Rust.
 lzma-rs = "0.3.0"
 ruzstd = "0.9.0"
+# Flatpak bundles and their unpacked delta parts are read in place, not into memory.
+memmap2 = "0.9"
 # OpenPGP, for signing InRelease and repomd.xml. rpgp's API wants rand 0.8.
 pgp = "0.21.0"
 rand = "0.8"
@@ -33,9 +35,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 toml = "1"
 libc = "0.2"
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+base64 = "0.22"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1.53.2", features = ["test-util"] }
 
 [profile.release]

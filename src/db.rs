@@ -1,6 +1,6 @@
 //! SQLite: the NIP-82 events the gateway follows, what each package file was
-//! found to be, which file each package version is pinned to, and the key
-//! each NIP-05 address last named. With those, every repository is rebuilt
+//! found to be, which commit each Flatpak bundle carried, which file each
+//! package version is pinned to, and the key each NIP-05 address last named. With those, every repository is rebuilt
 //! after a restart without the network.
 
 use std::collections::HashSet;
@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::inspect::{Format, Meta};
 use crate::nostr::Event;
+use crate::ostree::delta::Bundle;
 
 #[derive(Clone)]
 pub struct Db {
@@ -67,6 +68,12 @@ impl Db {
                json TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS events_by_address ON events (pubkey, kind, d);
+             CREATE TABLE IF NOT EXISTS bundles (
+               sha256 TEXT PRIMARY KEY,
+               -- The commit it carried, as JSON, or why it was refused.
+               bundle TEXT,
+               error TEXT
+             );
              DROP TABLE IF EXISTS snapshots;",
         )?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
@@ -118,6 +125,41 @@ impl Db {
                 "INSERT INTO packages (sha256, size, url, meta, error) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT (sha256) DO NOTHING",
                 params![sha256, size, url, meta, error],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The commit the Flatpak bundle with this hash carried, or why it was
+    /// refused; `None` if it hasn't been unpacked.
+    pub async fn bundle(&self, sha256: &str) -> anyhow::Result<Option<Result<Bundle, String>>> {
+        let sha256 = sha256.to_string();
+        let row = self
+            .call(move |conn| {
+                conn.query_row("SELECT bundle, error FROM bundles WHERE sha256 = ?", [sha256], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .optional()
+            })
+            .await?;
+        Ok(row.map(|(bundle, error)| match (bundle, error) {
+            (Some(bundle), _) => serde_json::from_str(&bundle).map_err(|error| format!("Stored bundle is unreadable: {error}")),
+            (None, error) => Err(error.unwrap_or_default()),
+        }))
+    }
+
+    pub async fn store_bundle(&self, sha256: &str, bundle: &Result<Bundle, String>) -> anyhow::Result<()> {
+        let (bundle, error) = match bundle {
+            Ok(bundle) => (Some(serde_json::to_string(bundle)?), None),
+            Err(error) => (None, Some(error.clone())),
+        };
+        let sha256 = sha256.to_string();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO bundles (sha256, bundle, error) VALUES (?, ?, ?)
+                 ON CONFLICT (sha256) DO UPDATE SET bundle = excluded.bundle, error = excluded.error",
+                params![sha256, bundle, error],
             )
         })
         .await?;

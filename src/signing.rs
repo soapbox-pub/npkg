@@ -16,11 +16,14 @@ use pgp::composed::{
     SignedPublicKey, SignedSecretKey,
 };
 use pgp::crypto::hash::HashAlgorithm;
+use pgp::ser::Serialize;
 use pgp::types::{KeyDetails, Password};
 
 pub struct Signer {
     key: SignedSecretKey,
     public: String,
+    /// The public key in binary, which Flatpak's `GPGKey=` wants in base64.
+    public_binary: Vec<u8>,
 }
 
 impl Signer {
@@ -29,8 +32,10 @@ impl Signer {
             .with_context(|| format!("Couldn't read the signing key at {}. Make one with `npkg-gateway keygen`.", path.display()))?;
         let (key, _) = SignedSecretKey::from_string(&armored).context("The signing key isn't an armored OpenPGP secret key.")?;
         key.verify_bindings().context("The signing key's self-signatures don't verify.")?;
-        let public = SignedPublicKey::from(key.clone()).to_armored_string(ArmorOptions::default())?;
-        Ok(Signer { key, public })
+        let public_key = SignedPublicKey::from(key.clone());
+        let public = public_key.to_armored_string(ArmorOptions::default())?;
+        let public_binary = public_key.to_bytes()?;
+        Ok(Signer { key, public, public_binary })
     }
 
     /// Make a key and write it to `path`, which must not exist yet: a
@@ -58,6 +63,10 @@ impl Signer {
         &self.public
     }
 
+    pub fn public_key_binary(&self) -> &[u8] {
+        &self.public_binary
+    }
+
     pub fn fingerprint(&self) -> String {
         self.key.fingerprint().to_string()
     }
@@ -70,14 +79,17 @@ impl Signer {
 
     /// A detached signature over `data`, armored: Release.gpg, repomd.xml.asc.
     pub fn sign_detached(&self, data: &[u8]) -> anyhow::Result<String> {
-        let signature = DetachedSignature::sign_binary_data(
-            rand::thread_rng(),
-            &self.key.primary_key,
-            &Password::empty(),
-            HashAlgorithm::Sha256,
-            data,
-        )?;
-        Ok(signature.to_armored_string(ArmorOptions::default())?)
+        Ok(self.detached(data)?.to_armored_string(ArmorOptions::default())?)
+    }
+
+    /// A detached signature over `data`, in binary, as OSTree keeps them
+    /// for commits and summaries.
+    pub fn sign_binary(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(self.detached(data)?.to_bytes()?)
+    }
+
+    fn detached(&self, data: &[u8]) -> anyhow::Result<DetachedSignature> {
+        Ok(DetachedSignature::sign_binary_data(rand::thread_rng(), &self.key.primary_key, &Password::empty(), HashAlgorithm::Sha256, data)?)
     }
 }
 
@@ -105,5 +117,9 @@ mod tests {
         let (signature, _) = DetachedSignature::from_string(&signer.sign_detached(b"<repomd/>").unwrap()).unwrap();
         signature.verify(&public, b"<repomd/>").unwrap();
         assert!(signature.verify(&public, b"<repomd />").is_err());
+
+        let signature = DetachedSignature::from_bytes(&signer.sign_binary(b"commit").unwrap()[..]).unwrap();
+        signature.verify(&public, b"commit").unwrap();
+        assert_eq!(SignedPublicKey::from_bytes(signer.public_key_binary()).unwrap(), public);
     }
 }

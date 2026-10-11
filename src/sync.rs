@@ -15,6 +15,10 @@
 //!
 //! A repository is only rebuilt when what it's built from changed, and a
 //! failed rebuild leaves the last one up.
+//!
+//! Once a day, after a resync, the OSTree store is pruned of what no
+//! repository's releases need any more. It happens here, between builds,
+//! so it never deletes an object a bundle being unpacked is counting on.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -36,6 +40,11 @@ const IDS_PER_FILTER: usize = 200;
 
 /// How long after the last new event its author's repositories are rebuilt.
 const SETTLE: Duration = Duration::from_secs(3);
+
+/// How often the OSTree store is pruned, and how old an object has to be to
+/// go: younger ones may belong to a bundle not served yet.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
+const PRUNE_GRACE: Duration = Duration::from_secs(24 * 3600);
 
 pub struct Worker {
     pub relays: Vec<String>,
@@ -68,6 +77,7 @@ impl Worker {
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut dirty = BTreeSet::new();
         let mut settled = Instant::now();
+        let mut pruned: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = resync.tick() => {
@@ -77,6 +87,10 @@ impl Worker {
                     self.repos.mark_synced();
                     // A full resync covered whatever was waiting.
                     dirty.clear();
+                    if pruned.is_none_or(|at| at.elapsed() >= PRUNE_EVERY) {
+                        self.prune().await;
+                        pruned = Some(Instant::now());
+                    }
                 }
                 Some(event) = live.recv() => {
                     if let Some(author) = self.store(event).await {
@@ -90,6 +104,19 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    /// Delete the objects no repository's bundles need.
+    async fn prune(&self) {
+        let keep: HashSet<String> =
+            self.repos.all().iter().flat_map(|repo| repo.bundles.iter().map(|bundle| bundle.bundle.commit.clone())).collect();
+        let store = self.repos.store().clone();
+        match tokio::task::spawn_blocking(move || store.prune(&keep, PRUNE_GRACE)).await {
+            Ok(Ok((0, _))) => {}
+            Ok(Ok((objects, bytes))) => tracing::info!(objects, bytes, "pruned the OSTree store"),
+            Ok(Err(error)) => tracing::warn!(?error, "couldn't prune the OSTree store"),
+            Err(error) => tracing::warn!(?error, "couldn't prune the OSTree store"),
         }
     }
 

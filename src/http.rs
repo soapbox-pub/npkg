@@ -1,5 +1,6 @@
 //! The routes. Every repository is addressed by its format first, then its
-//! application's author and `d` tag: `/apt/<owner>/<d>`, `/rpm/<owner>/<d>`.
+//! application's author and `d` tag: `/apt/<owner>/<d>`, `/rpm/<owner>/<d>`,
+//! `/flatpak/<owner>/<d>`.
 //! The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
 //! `soapbox.pub` for `_@soapbox.pub`). The URLs a repository hands out keep
 //! the form they were asked for by, so a NIP-05 repository follows its name
@@ -15,18 +16,21 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 
+use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::inspect::Format;
 use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
-use crate::repo::{CHANNELS, Lookup, Release, Repo, Repos, channel_rank};
+use crate::ostree;
+use crate::repo::{CHANNELS, FlatpakChannel, Lookup, Release, Repo, Repos, channel_rank};
 use crate::{apt, nip82};
 
 pub struct AppState {
@@ -52,6 +56,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/rpm/{owner}/{d}/repo", get(rpm_repo))
         .route("/rpm/{owner}/{d}/{channel}/repodata/{file}", get(rpm_repodata))
         .route("/rpm/{owner}/{d}/{channel}/packages/{sha256}/{file}", get(rpm_package))
+        .route("/flatpak/{owner}/{d}", get(status))
+        .route("/flatpak/{owner}/{d}/{file}", get(flatpak_setup))
+        .route("/flatpak/{owner}/{d}/{channel}/{file}", get(flatpak_top))
+        .route("/flatpak/{owner}/{d}/{channel}/objects/{prefix}/{file}", get(flatpak_object))
         .route("/releases/{owner}/{d}", get(releases))
         .route("/releases/{owner}/{d}/latest", get(latest_release))
         .route("/releases/{owner}/{d}/latest/download/{name}", get(latest_download))
@@ -215,7 +223,16 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
             d = segment(&repo.d)
         );
     }
-    let _ = writeln!(out, "Channels: {} (add ?channel=beta to either setup URL)", CHANNELS.join(", "));
+    if let Some(app) =
+        repo.flatpak(0).or_else(|| (1..CHANNELS.len()).find_map(|rank| repo.flatpak(rank))).and_then(|channel| flatpak_app(&repo, channel))
+    {
+        let _ = writeln!(
+            out,
+            "Flatpak:\n  flatpak install --user {base}/flatpak/{owner}/{d}/{file}.flatpakref\n  flatpak run {app}\n",
+            d = segment(&repo.d)
+        );
+    }
+    let _ = writeln!(out, "Channels: {} (add ?channel=beta to any setup URL)", CHANNELS.join(", "));
     let _ = writeln!(out, "This repository serves whatever packages its author publishes, under any name.\n");
     let _ = writeln!(
         out,
@@ -245,6 +262,14 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
             CHANNELS[package.channel],
             package.sha256
         );
+    }
+    if !repo.bundles.is_empty() {
+        let _ = writeln!(out, "\nFlatpak:");
+        for (rank, channel) in CHANNELS.iter().enumerate() {
+            for head in repo.flatpak(rank).map_or(&[][..], |channel| &channel.refs[..]) {
+                let _ = writeln!(out, "  {channel}: {} from {} ({})", head.bundle.ref_name, head.release, head.bundle.commit);
+            }
+        }
     }
     if !repo.rejections.is_empty() {
         let _ = writeln!(out, "\nLeft out:");
@@ -412,6 +437,137 @@ async fn download(state: &AppState, client: IpAddr, owner: &str, d: &str, format
         Some(url) => Redirect::to(url).into_response(),
         None => error(StatusCode::NOT_FOUND, "This repository has no such package."),
     }
+}
+
+/// The app a channel's `.flatpakref` installs: the one named like the
+/// repository if there is one, or else the first. Its id, and its branch.
+fn flatpak_app<'a>(repo: &Repo, channel: &'a FlatpakChannel) -> Option<&'a str> {
+    let app_id = |head: &'a crate::repo::FlatpakBundle| head.bundle.ref_name.split('/').nth(1);
+    channel.refs.iter().find(|head| app_id(head) == Some(repo.d.as_str())).or(channel.refs.first()).and_then(app_id)
+}
+
+/// A `.flatpakref`, which installs the app and adds its remote in one go,
+/// or a `.flatpakrepo`, which only adds the remote. Both carry the gateway's
+/// key, which Flatpak checks every summary and commit against.
+async fn flatpak_setup(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, file)): Path<(String, String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let (repo, owner) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let channel = match setup_channel(&query) {
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+    let rank = channel_rank(channel).unwrap_or(0);
+    let Some(remote) = repo.flatpak(rank) else {
+        return error(StatusCode::NOT_FOUND, format!("{} has no Flatpak bundle on the {channel} channel.", repo.name));
+    };
+    let url = format!("{}/flatpak/{owner}/{}/{channel}/", state.public_url, segment(&repo.d));
+    let key = base64::engine::general_purpose::STANDARD.encode(state.repos.signer().public_key_binary());
+    let title = repo.name.replace('\n', " ");
+    // Remote names are what `flatpak remotes` lists: one per channel.
+    let remote_name = if rank == 0 { file_stem(&repo.d) } else { format!("{}-{channel}", file_stem(&repo.d)) };
+    if file.ends_with(".flatpakrepo") {
+        return text(
+            "application/vnd.flatpak.repo",
+            format!("[Flatpak Repo]\nTitle={title} ({channel}, from npkg-gateway)\nUrl={url}\nGPGKey={key}\n"),
+        );
+    }
+    if !file.ends_with(".flatpakref") {
+        return error(StatusCode::NOT_FOUND, "There's no such file. Try one ending in .flatpakref or .flatpakrepo.");
+    }
+    let Some(head) =
+        flatpak_app(&repo, remote).and_then(|app| remote.refs.iter().find(|head| head.bundle.ref_name.split('/').nth(1) == Some(app)))
+    else {
+        return error(StatusCode::NOT_FOUND, format!("{} has no Flatpak app on the {channel} channel.", repo.name));
+    };
+    let parts: Vec<&str> = head.bundle.ref_name.split('/').collect();
+    text(
+        "application/vnd.flatpak.ref",
+        format!(
+            "[Flatpak Ref]\nTitle={title}\nName={}\nBranch={}\nUrl={url}\nSuggestRemoteName={remote_name}\nIsRuntime=false\nGPGKey={key}\nRuntimeRepo={FLATHUB}\n",
+            parts[1], parts[3]
+        ),
+    )
+}
+
+/// Where the runtimes apps depend on come from: Flatpak adds it, if it isn't
+/// already, when it installs a `.flatpakref` naming it.
+const FLATHUB: &str = "https://dl.flathub.org/repo/flathub.flatpakrepo";
+
+/// A channel's remote's `config`, `summary` and `summary.sig`.
+async fn flatpak_top(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, channel, file)): Path<(String, String, String, String)>,
+) -> Response {
+    let Some(rank) = channel_rank(&channel) else {
+        return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
+    };
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    if repo.flatpak(rank).is_none() {
+        return error(StatusCode::NOT_FOUND, format!("{} has no Flatpak bundle on the {channel} channel.", repo.name));
+    }
+    if file == "config" {
+        return text("text/plain; charset=utf-8", "[core]\nrepo_version=1\nmode=archive-z2\n");
+    }
+    // No summary.idx: Flatpak falls back to the summary itself.
+    match repo.flatpak_file(rank, &file) {
+        Some(body) => text("application/octet-stream", body.to_vec()),
+        None => error(StatusCode::NOT_FOUND, "There's no such file."),
+    }
+}
+
+/// An object from the store, or a commit's signature. Objects are named by
+/// their checksums and never change, so they're cached forever.
+async fn flatpak_object(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, channel, prefix, file)): Path<(String, String, String, String, String)>,
+) -> Response {
+    let Some(rank) = channel_rank(&channel) else {
+        return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
+    };
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let not_found = || error(StatusCode::NOT_FOUND, "There's no such object.");
+    let Some((rest, extension)) = file.split_once('.') else { return not_found() };
+    let checksum = format!("{prefix}{rest}");
+    if repo.flatpak(rank).is_none() || !ostree::is_checksum(&checksum) || prefix.len() != 2 {
+        return not_found();
+    }
+    let immutable = |content_type: &'static str, body: Body| {
+        ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], body).into_response()
+    };
+    if extension == "commitmeta" {
+        return match repo.commitmeta(&checksum) {
+            // Signed afresh by each build, so not cached for long.
+            Some(body) => text("application/octet-stream", body.to_vec()),
+            None => not_found(),
+        };
+    }
+    let Some(kind) = ostree::Kind::from_extension(extension) else { return not_found() };
+    let file = match tokio::fs::File::open(state.repos.store().path(kind, &checksum)).await {
+        Ok(file) => file,
+        Err(_) => return not_found(),
+    };
+    let length = match file.metadata().await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return not_found(),
+    };
+    let mut response = immutable("application/octet-stream", Body::from_stream(tokio_util::io::ReaderStream::new(file)));
+    response.headers_mut().insert(header::CONTENT_LENGTH, header::HeaderValue::from(length));
+    response
 }
 
 /// Where a repository's releases are listed: no trailing slash.
