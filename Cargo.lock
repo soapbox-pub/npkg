@@ -1638,6 +1638,7 @@ dependencies = [
  "libc",
  "lzma-rs",
  "memmap2",
+ "p256",
  "pgp",
  "quick-xml",
  "rand 0.8.8",

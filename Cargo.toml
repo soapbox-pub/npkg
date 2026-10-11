@@ -39,6 +39,7 @@ tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"
 quick-xml = "0.42.0"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["test-util"] }

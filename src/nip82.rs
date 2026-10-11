@@ -17,11 +17,19 @@ pub const KINDS: [i64; 3] = [APPLICATION, RELEASE, ASSET];
 pub const DEB_MIME: &str = "application/vnd.debian.binary-package";
 pub const RPM_MIME: &str = "application/x-rpm";
 pub const FLATPAK_MIME: &str = "application/vnd.flatpak";
+pub const APK_MIME: &str = "application/vnd.android.package-archive";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Application {
     pub name: Option<String>,
     pub summary: Option<String>,
+    pub description: String,
+    /// The `icon`, `url` and `repository` tags.
+    pub icon: Option<String>,
+    pub website: Option<String>,
+    pub repository: Option<String>,
+    pub license: Option<String>,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +123,16 @@ pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
         .iter()
         .filter(|event| event.kind == APPLICATION && event.tag("d") == Some(d))
         .max_by_key(|event| (event.created_at, std::cmp::Reverse(event.id.clone())))
-        .map(|event| Application { name: event.tag("name").map(one_line), summary: event.tag("summary").map(one_line) });
+        .map(|event| Application {
+            name: event.tag("name").map(one_line),
+            summary: event.tag("summary").map(one_line),
+            description: event.content.clone(),
+            icon: event.tag("icon").map(str::to_string),
+            website: event.tag("url").map(str::to_string),
+            repository: event.tag("repository").map(str::to_string),
+            license: event.tag("license").map(one_line),
+            created_at: event.created_at,
+        });
 
     // Releases are addressable: of each `d`, the newest stands.
     let mut newest: HashMap<&str, &Event> = HashMap::new();

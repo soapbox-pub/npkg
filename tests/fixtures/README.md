@@ -67,3 +67,40 @@ ostree --repo=repo ls -RC appstream2/x86_64   # the checksums of / and /icons
 
 A rebuild gives a different commit (it records the build's Flatpak version),
 so the tests' expected commit changes with it.
+
+`hello.apk` is a tiny real APK, `org.example.hello` 1.2.3-rc.1 (versionCode
+10203), with permissions, features, native code for two ABIs (zeros, not
+real code), and v1, v2 and v3 signatures, made by aapt2, zipalign and
+apksigner from build-tools 36.0.0. Its signer's certificate SHA-256 is in
+`src/inspect/apk.rs`, as `apksigner verify --print-certs` gives it. A
+rebuild has a new key, so that changes with it. To rebuild it:
+
+```sh
+BT=~/Android/Sdk/build-tools/36.0.0
+mkdir -p res/values lib/arm64-v8a lib/x86_64
+cat > AndroidManifest.xml <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.example.hello" android:versionCode="10203" android:versionName="1.2.3-rc.1">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.CAMERA" android:maxSdkVersion="28" />
+  <uses-permission-sdk-23 android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-feature android:name="android.hardware.camera" android:required="false" />
+  <uses-feature android:name="android.hardware.bluetooth" />
+  <uses-feature android:glEsVersion="0x00020000" />
+  <application android:label="@string/app_name" android:hasCode="false" />
+</manifest>
+XML
+printf '<resources><string name="app_name">Hello</string></resources>\n' > res/values/strings.xml
+$BT/aapt2 compile --dir res -o res.zip
+$BT/aapt2 link -I ~/Android/Sdk/platforms/android-34/android.jar --manifest AndroidManifest.xml -o unsigned.apk res.zip
+head -c 256 /dev/zero > lib/arm64-v8a/libhello.so; cp lib/arm64-v8a/libhello.so lib/x86_64/
+zip -q -X -9 unsigned.apk lib/arm64-v8a/libhello.so lib/x86_64/libhello.so
+$BT/zipalign -f 4 unsigned.apk aligned.apk
+keytool -genkeypair -keystore k.jks -storepass password -keypass password -alias hello \
+  -keyalg RSA -keysize 2048 -validity 10000 -dname CN=hello -noprompt
+$BT/apksigner sign --ks k.jks --ks-pass pass:password --v1-signing-enabled true \
+  --v2-signing-enabled true --v3-signing-enabled true --min-sdk-version 24 --out hello.apk aligned.apk
+$BT/apksigner verify --print-certs hello.apk   # the signer's SHA-256
+```

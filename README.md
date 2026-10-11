@@ -1,6 +1,7 @@
 # npkg
 
-apt, dnf and Flatpak repositories for software a team releases on Nostr.
+apt, dnf, Flatpak and F-Droid repositories for software a team releases on
+Nostr.
 
 The gateway follows the NIP-82 events of the authors its operator lists, and
 every application they publish gets its own repository, addressed by its
@@ -10,6 +11,7 @@ author and its `d` tag:
 /apt/<owner>/<d>       # Debian, Ubuntu
 /rpm/<owner>/<d>       # Fedora, RHEL, Rocky
 /flatpak/<owner>/<d>   # any Linux, through Flatpak
+/fdroid/<owner>/<d>    # Android, through F-Droid
 ```
 
 The owner is the author's npub, or a NIP-05 address that names them:
@@ -36,6 +38,9 @@ sudo dnf install npanel
 flatpak install --user \
   https://<host>/flatpak/soapbox.pub/buzz.armada.app/buzz.armada.app.flatpakref
 ```
+
+For F-Droid, add the repository URL the status page gives, which has the
+repository's fingerprint in it, in Settings, Repositories.
 
 Add `?channel=beta` (or `nightly`, `dev`) to a setup URL to follow a
 less stable channel. The gateway's front page lists every repository.
@@ -147,21 +152,52 @@ names, descriptions and icons. They're made from the AppStream data
 `flatpak-builder` puts in each app, `files/share/app-info/`; an app built
 without it installs, but isn't listed.
 
+## F-Droid
+
+A release's APKs (`application/vnd.android.package-archive` assets) are
+listed in an F-Droid repository (index v2) at `/fdroid/<owner>/<d>/repo`,
+under the package names the APKs give, with what their manifests say:
+version, SDK versions, permissions, ABIs and signer. The application's
+name, summary, description, icon, website and license come from its NIP-82
+event.
+
+F-Droid knows a repository by the key that signs it, so each application
+has a key of its own: adding one trusts that application's author, not the
+whole team. The keys are P-256, derived from the gateway's OpenPGP key, so
+there's nothing more to back up, and an application's fingerprint never
+changes. The status page gives it, in the URL to add the repository by.
+
+The repository's address is the one with the author's npub. Added by a
+NIP-05 address, F-Droid keeps that as a mirror of it.
+
+F-Droid has one channel besides releases, Beta, which users turn on app by
+app. Releases on NIP-82's beta, nightly and dev channels, and prerelease
+versions like `1.2.0-rc.1`, are all in it.
+
+F-Droid doesn't follow redirects, so APKs are passed through the gateway
+from Blossom as they're downloaded, which costs it the bandwidth. They
+aren't kept.
+
+## Channels
+
 The channels are `stable`, `beta`, `nightly` and `dev`: an apt suite or a
 dnf repository each. Each one includes every more stable channel, so `beta`
 has the stable releases too. `stable` holds the releases NIP-82 tags `main`.
 
 ## Trust
 
-apt, dnf and Flatpak can't check Nostr signatures. The gateway checks each
-event's signature and each file's sha256, and then signs the repository
-metadata (`InRelease`, `repomd.xml`, a Flatpak remote's summary and
-commits) with its own Ed25519 OpenPGP key. Users who add a
+apt, dnf, Flatpak and F-Droid can't check Nostr signatures. The gateway
+checks each event's signature and each file's sha256, and then signs the
+repository metadata (`InRelease`, `repomd.xml`, a Flatpak remote's summary
+and commits) with its own Ed25519 OpenPGP key, and F-Droid's `entry.jar`
+with a key derived from it. Users who add a
 repository are trusting the gateway to have done that, and the author as
 much as any third-party repository: the author can publish any package,
 under any name. Package downloads are redirects to Blossom: apt and dnf
 check each file against the hash in the signed index, so the server a file
-comes from doesn't need to be trusted.
+comes from doesn't need to be trusted. F-Droid does the same with the APKs
+the gateway passes on, and also refuses an update signed by a different
+key from the installed app's.
 
 Release files are different. The gateway doesn't download them, and
 nothing checks them on the way down: a download is a redirect to the URL
@@ -221,9 +257,10 @@ on the team, are required; `npkg.example.toml` lists every setting
 default. An author taken off the list has their events forgotten at the next
 start.
 
-The first start downloads every `.deb`, `.rpm` and `.flatpak` the team has
-released, once. Of a `.deb` or `.rpm`, only what it is is kept: package
-downloads are redirects to Blossom. A `.flatpak` is unpacked into
+The first start downloads every `.deb`, `.rpm`, `.apk` and `.flatpak` the
+team has released, once. Of a `.deb`, `.rpm` or `.apk`, only what it is is
+kept: package downloads are redirects to Blossom, or passed through from it
+for F-Droid. A `.flatpak` is unpacked into
 `data_dir/ostree`, which Flatpak remotes are served from, and that takes
 disk: about one copy of each app, plus what changed in each release.
 
@@ -234,6 +271,8 @@ anyone else can read it. Back it up: every user's setup trusts that key.
 Put a reverse proxy in front, on the same machine, terminating TLS and
 setting `X-Forwarded-For`. The gateway itself has no timeouts or limits on
 connections, which the proxy should bring. Serve users over https:
-`InRelease`, `repomd.xml` and Flatpak summaries don't expire, so over plain
-http whoever is on the path could keep handing out old ones. The gateway
+`InRelease`, `repomd.xml`, Flatpak summaries and F-Droid indexes don't
+expire, so over plain http whoever is on the path could keep handing out old
+ones. F-Droid only follows https links to a repository, though it takes an
+http one typed in. The gateway
 warns at startup if `public_url` is http.

@@ -1,7 +1,7 @@
 //! A repository: one NIP-82 application's packages, built from its author's
-//! events, rendered for apt and dnf, and signed.
+//! events, rendered for apt, dnf and F-Droid, and signed.
 //!
-//! A repository serves every .deb and .rpm its application's releases list,
+//! A repository serves every .deb, .rpm and APK its application's releases list,
 //! under whatever names the files give themselves, the way a PPA serves
 //! whatever its owner uploads, and every Flatpak app its `.flatpak` bundles
 //! carry, unpacked into the gateway's OSTree store. The release is only how a file is found: what
@@ -28,7 +28,7 @@ use crate::nostr::nip19;
 use crate::ostree::delta::{self, Bundle};
 use crate::ostree::{Kind, Store, appstream, summary};
 use crate::signing::Signer;
-use crate::{apt, net, rpmmd};
+use crate::{apt, fdroid, net, rpmmd};
 
 /// The channels a repository offers, most stable first: apt suites, and dnf
 /// repositories. Each holds its own releases and every more stable channel's,
@@ -45,6 +45,9 @@ const MAX_PACKAGE: u64 = 512 << 20;
 
 /// Package files downloaded at once, per repository.
 const DOWNLOADS: usize = 4;
+
+/// The largest icon downloaded for F-Droid.
+const MAX_ICON: u64 = 1 << 20;
 
 /// The most package files one repository considers.
 const MAX_CANDIDATES: usize = 500;
@@ -95,6 +98,22 @@ pub struct FlatpakChannel {
     summary_sig: Vec<u8>,
 }
 
+/// The F-Droid repository: its key's fingerprint, where it says it is, and
+/// its files.
+pub struct FdroidRepo {
+    pub fingerprint: String,
+    pub address: String,
+    files: HashMap<String, Vec<u8>>,
+    /// The name the index gives the app's icon, and the icon.
+    pub icon: Option<(String, Vec<u8>)>,
+}
+
+impl FdroidRepo {
+    pub fn file(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(name).map(Vec::as_slice)
+    }
+}
+
 /// A NIP-82 release, as the gateway lists it for downloading its files
 /// directly.
 #[derive(Clone, Debug)]
@@ -122,6 +141,8 @@ pub struct Repo {
     apt: HashMap<String, HashMap<String, Vec<u8>>>,
     /// By channel, then by path below it.
     rpm: HashMap<usize, HashMap<String, Vec<u8>>>,
+    /// If any release has an APK.
+    pub fdroid: Option<FdroidRepo>,
     /// Every bundle the releases list that unpacked, oldest first.
     pub bundles: Vec<FlatpakBundle>,
     /// By channel, for each channel some release has a bundle on.
@@ -180,10 +201,10 @@ impl Repo {
         self.objects.contains(&(kind, checksum.to_string()))
     }
 
-    /// Where to download the file with this hash, if it's one of this
-    /// repository's. Nothing else is redirected to.
-    pub fn download_url(&self, format: Format, sha256: &str) -> Option<&str> {
-        self.packages.iter().find(|package| package.sha256 == sha256 && package.meta.format() == format).map(|package| package.url.as_str())
+    /// The file with this hash, if it's one of this repository's. Nothing
+    /// else is downloaded from it.
+    pub fn package(&self, format: Format, sha256: &str) -> Option<&Package> {
+        self.packages.iter().find(|package| package.sha256 == sha256 && package.meta.format() == format)
     }
 
     /// The release with this version.
@@ -218,11 +239,16 @@ pub enum Lookup {
 }
 
 pub struct Repos {
+    /// Where the gateway is reached: no trailing slash.
+    public_url: String,
     /// Blossom servers to look for a package file on, after its own URL.
     blossom: Vec<String>,
     db: Db,
     store: Store,
     http: reqwest::Client,
+    /// For files passed through to clients as they download them, which
+    /// can take as long as their connection does.
+    streaming: reqwest::Client,
     signer: Arc<Signer>,
     /// By author and `d`. Never held across an await.
     built: std::sync::RwLock<HashMap<(String, String), Arc<Repo>>>,
@@ -230,18 +256,31 @@ pub struct Repos {
 }
 
 impl Repos {
-    pub fn new(blossom: Vec<String>, db: Db, store: Store, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
+    pub fn new(public_url: String, blossom: Vec<String>, db: Db, store: Store, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
         // Authors name the URLs, and Blossom servers redirect where they
         // like: only the configured servers may be private.
-        let trusted = blossom.iter().filter_map(|server| reqwest::Url::parse(server).ok()?.host_str().map(str::to_string));
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("npkg/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .redirect(net::redirect_policy())
-            .dns_resolver(net::PublicResolver::new(trusted))
-            .build()?;
-        Ok(Arc::new(Repos { blossom, db, store, http, signer, built: Default::default(), synced: AtomicBool::new(false) }))
+        let trusted: Vec<String> =
+            blossom.iter().filter_map(|server| reqwest::Url::parse(server).ok()?.host_str().map(str::to_string)).collect();
+        let client = || {
+            reqwest::Client::builder()
+                .user_agent(concat!("npkg/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(net::redirect_policy())
+                .dns_resolver(net::PublicResolver::new(trusted.clone()))
+        };
+        let http = client().timeout(Duration::from_secs(300)).build()?;
+        let streaming = client().read_timeout(Duration::from_secs(60)).build()?;
+        Ok(Arc::new(Repos {
+            public_url,
+            blossom,
+            db,
+            store,
+            http,
+            streaming,
+            signer,
+            built: Default::default(),
+            synced: AtomicBool::new(false),
+        }))
     }
 
     pub fn signer(&self) -> &Signer {
@@ -444,9 +483,25 @@ impl Repos {
         let summary = snapshot.application.as_ref().and_then(|app| app.summary.clone());
         let signer = self.signer.clone();
         let description = format!("{name}, published on Nostr by {}", nip19::npub_encode(pubkey));
+        let address = format!("{}/fdroid/{}/{}/repo", self.public_url, nip19::npub_encode(pubkey), crate::http::segment(d));
+        let last_index = self.db.fdroid_index(pubkey, d).await?;
+        let has_apks = packages.iter().any(|package| package.meta.format() == Format::Apk);
+        let icon_url = snapshot.application.as_ref().and_then(|app| app.icon.clone());
+        let icon = match icon_url.filter(|_| has_apks) {
+            Some(url) => match self.icon(&url, offline).await {
+                Ok(icon) => icon,
+                Err(error) => {
+                    // Shown without it, and tried again next time.
+                    tracing::info!(pubkey, d, url, error = format!("{error:#}"), "icon left out");
+                    incomplete = true;
+                    None
+                }
+            },
+            None => None,
+        };
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let store = self.store.clone();
-        let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<Repo> {
+        let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<(Repo, Option<(String, i64)>)> {
             let mut apt = HashMap::new();
             let mut rpm = HashMap::new();
             let mut flatpak = HashMap::new();
@@ -466,6 +521,41 @@ impl Repos {
                     flatpak.insert(rank, FlatpakChannel { refs, appstream, summary, summary_sig });
                 }
             }
+            let apks: Vec<&Package> = packages.iter().filter(|package| package.meta.format() == Format::Apk).collect();
+            let fdroid = (!apks.is_empty()).then(|| {
+                let key = fdroid::Key::derive(&signer, &pubkey, &d);
+                let application = snapshot.application.as_ref();
+                let icon = icon.map(|data| (format!("icon-{}", hex::encode(Sha256::digest(&data))), data));
+                let icon_file = icon.as_ref().map(|(name, data)| fdroid::File {
+                    name: format!("/{name}"),
+                    sha256: name["icon-".len()..].to_string(),
+                    size: data.len() as u64,
+                });
+                let about = fdroid::About {
+                    address: &address,
+                    d: &d,
+                    name: &name,
+                    description: &description,
+                    application,
+                    icon: icon_file.as_ref(),
+                };
+                // F-Droid only reads an index dated later than the last one
+                // it read, so a changed index is dated later than the last,
+                // even when what changed it, such as a file that couldn't be
+                // downloaded before, has no date of its own.
+                let content = hex::encode(Sha256::digest(fdroid::index(&about, &apks, &releases, 0)));
+                let newest = apks.iter().map(|package| package.created_at).chain(application.map(|app| app.created_at)).max().unwrap_or(0);
+                let (timestamp, changed) = match &last_index {
+                    Some((sha256, timestamp)) if *sha256 == content => (*timestamp, false),
+                    Some((_, timestamp)) => ((newest.max(0) * 1000).max(timestamp + 1), true),
+                    None => (newest.max(0) * 1000, true),
+                };
+                let index = fdroid::index(&about, &apks, &releases, timestamp);
+                let count = apks.iter().map(|package| package.meta.name()).collect::<HashSet<_>>().len();
+                let files = fdroid::render(&key, &pubkey, &d, index, count, timestamp);
+                let dated = changed.then_some((content, timestamp));
+                (FdroidRepo { fingerprint: key.fingerprint(), address: address.clone(), files, icon }, dated)
+            });
             let mut commitmeta = HashMap::new();
             let mut objects = HashSet::new();
             let appstream = flatpak.values().flat_map(|channel| channel.appstream.iter().map(|branch| &branch.commit));
@@ -475,7 +565,11 @@ impl Repos {
                     objects.extend(store.reachable(commit)?);
                 }
             }
-            Ok(Repo {
+            let (fdroid, dated) = match fdroid {
+                Some((fdroid, dated)) => (Some(fdroid), dated),
+                None => (None, None),
+            };
+            let repo = Repo {
                 pubkey,
                 d,
                 name,
@@ -485,15 +579,22 @@ impl Repos {
                 releases,
                 apt,
                 rpm,
+                fdroid,
                 bundles,
                 flatpak,
                 commitmeta,
                 objects,
                 snapshot,
                 incomplete,
-            })
+            };
+            Ok((repo, dated))
         })
         .await??;
+        let (repo, dated) = repo;
+        // Stored, so that the next build dates it afresh only if it changes.
+        if let Some((content, timestamp)) = dated {
+            self.db.store_fdroid_index(&repo.pubkey, &repo.d, &content, timestamp).await?;
+        }
 
         tracing::info!(
             pubkey = repo.pubkey,
@@ -590,8 +691,67 @@ impl Repos {
     /// Where to look for `asset`: its own URL, if it's a public https one,
     /// then each Blossom server.
     fn urls(&self, asset: &Asset) -> Vec<String> {
-        let own = asset.url.iter().filter(|url| reqwest::Url::parse(url).is_ok_and(|url| net::is_public_url(&url))).cloned();
-        own.chain(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256))).collect()
+        self.urls_for(asset.url.as_deref(), &asset.sha256)
+    }
+
+    fn urls_for(&self, own: Option<&str>, sha256: &str) -> Vec<String> {
+        let own = own.filter(|url| reqwest::Url::parse(url).is_ok_and(|url| net::is_public_url(&url))).map(str::to_string);
+        let mut urls: Vec<String> =
+            own.into_iter().chain(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), sha256))).collect();
+        let mut seen = HashSet::new();
+        urls.retain(|url| seen.insert(url.clone()));
+        urls
+    }
+
+    /// `package`, fetched for a client from where it was found, or else
+    /// a Blossom server, as the client downloads it: `range` is passed on.
+    /// For clients that don't follow redirects, as F-Droid doesn't. The
+    /// gateway doesn't check what it passes on; the client checks it
+    /// against the hash in the signed index.
+    pub async fn fetch(&self, package: &Package, range: Option<&str>) -> anyhow::Result<reqwest::Response> {
+        let mut urls = vec![package.url.clone()];
+        urls.extend(self.urls_for(None, &package.sha256).into_iter().filter(|url| *url != package.url));
+        self.fetch_first(&urls, range).await
+    }
+
+    /// The icon at `url`, from the database, or downloaded. `None` if
+    /// it's not at a URL the gateway fetches from. Kept by URL: an icon on
+    /// Blossom is named by its hash, so a new one has a new URL.
+    async fn icon(&self, url: &str, offline: bool) -> anyhow::Result<Option<Vec<u8>>> {
+        if !reqwest::Url::parse(url).is_ok_and(|url| net::is_public_url(&url)) {
+            return Ok(None);
+        }
+        if let Some(icon) = self.db.icon(url).await? {
+            return Ok(Some(icon));
+        }
+        anyhow::ensure!(!offline, "The icon isn't downloaded yet.");
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        let mut stream = response.bytes_stream();
+        let mut icon = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            icon.extend_from_slice(&chunk?);
+            anyhow::ensure!(icon.len() as u64 <= MAX_ICON, "The icon at {url} is larger than {MAX_ICON} bytes.");
+        }
+        self.db.store_icon(url, &icon).await?;
+        Ok(Some(icon))
+    }
+
+    async fn fetch_first(&self, urls: &[String], range: Option<&str>) -> anyhow::Result<reqwest::Response> {
+        let mut last_error = anyhow::anyhow!("The file has no URL to fetch it from.");
+        for url in urls {
+            let mut request = self.streaming.get(url);
+            if let Some(range) = range {
+                request = request.header(reqwest::header::RANGE, range);
+            }
+            match request.send().await.and_then(reqwest::Response::error_for_status) {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::debug!(url, %error, "fetch failed");
+                    last_error = error.into();
+                }
+            }
+        }
+        Err(last_error)
     }
 
     /// Download `url` into a temporary file in the store, checking it's the
@@ -683,6 +843,11 @@ fn unlistable(meta: &Meta) -> Option<String> {
         Meta::Rpm(rpm) => {
             if !rpm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)) {
                 return Some(format!("{:?} isn't a name rpm accepts.", rpm.name));
+            }
+        }
+        Meta::Apk(apk) => {
+            if !crate::fdroid::valid_package(&apk.package) {
+                return Some(format!("{:?} isn't a package name Android accepts.", apk.package));
             }
         }
     }
@@ -810,7 +975,7 @@ mod tests {
             platforms: vec!["linux-x86_64".into()],
         };
         nip82::Snapshot {
-            application: Some(nip82::Application { name: Some("Hello".into()), summary: None }),
+            application: Some(nip82::Application { name: Some("Hello".into()), ..Default::default() }),
             releases: vec![nip82::Release {
                 version: "1.2.0-rc.1".into(),
                 channel: "main".into(),
@@ -825,7 +990,7 @@ mod tests {
         let key = dir.join(format!("key-{}.asc", rand::random::<u32>()));
         let signer = Arc::new(Signer::generate(&key, "test").unwrap());
         let store = Store::open(&dir.join("ostree")).unwrap();
-        Repos::new(Vec::new(), db.clone(), store, signer).unwrap()
+        Repos::new("https://pkg.example.com".into(), Vec::new(), db.clone(), store, signer).unwrap()
     }
 
     #[tokio::test]
@@ -923,6 +1088,62 @@ mod tests {
         // Another process, from the same database, serves the same index.
         let again = repos(dir.path(), &db).build("pk", "hello", &snapshot, true).await.unwrap();
         assert_eq!(again.apt_file("stable", "Release"), repo.apt_file("stable", "Release"));
+    }
+
+    #[tokio::test]
+    async fn serves_apks_to_fdroid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let bytes = include_bytes!("../tests/fixtures/hello.apk");
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        let meta = inspect::inspect(Format::Apk, bytes).unwrap();
+        let url = "https://example.com/hello.apk".to_string();
+        db.store_inspected(&sha256, &Inspected { size: bytes.len() as u64, url, meta: Ok(meta) }).await.unwrap();
+        let asset = |sha256: &str| Asset {
+            mime: nip82::APK_MIME.into(),
+            sha256: sha256.into(),
+            url: None,
+            filename: None,
+            size: None,
+            platforms: Vec::new(),
+        };
+        let mut snapshot = nip82::Snapshot {
+            application: Some(nip82::Application { name: Some("Hello".into()), created_at: 50, ..Default::default() }),
+            releases: vec![nip82::Release {
+                version: "1.2.3-rc.1".into(),
+                channel: "main".into(),
+                created_at: 100,
+                notes: "First.".into(),
+                assets: vec![asset(&sha256), asset(&"c".repeat(64))],
+            }],
+        };
+        let repos = repos(dir.path(), &db);
+        let repo = repos.build("pk", "org.example.hello", &snapshot, true).await.unwrap();
+        let fdroid = repo.fdroid.as_ref().unwrap();
+        assert_eq!(fdroid.address, format!("https://pkg.example.com/fdroid/{}/org.example.hello/repo", nip19::npub_encode("pk")));
+        let index: serde_json::Value = serde_json::from_slice(fdroid.file("index-v2.json").unwrap()).unwrap();
+        assert_eq!(index["repo"]["timestamp"], 100_000);
+        let package = &index["packages"]["org.example.hello"];
+        assert_eq!(package["metadata"]["name"]["en-US"], "Hello");
+        let version = &package["versions"][&sha256];
+        assert_eq!(version["manifest"]["versionCode"], 10203);
+        assert_eq!(version["file"]["name"], format!("/{sha256}/org.example.hello_10203.apk"));
+        // A prerelease version is beta, whatever its channel.
+        assert_eq!(version["releaseChannels"], serde_json::json!(["Beta"]));
+        assert_eq!(version["whatsNew"]["en-US"], "First.");
+        let entry: serde_json::Value = serde_json::from_slice(fdroid.file("entry.json").unwrap()).unwrap();
+        assert_eq!(entry["index"]["sha256"], hex::encode(Sha256::digest(fdroid.file("index-v2.json").unwrap())));
+        assert!(fdroid.file("entry.jar").is_some());
+
+        // The same index again keeps its date; a changed one with no newer
+        // event is dated after it all the same, or F-Droid would skip it.
+        let again = repos.build("pk", "org.example.hello", &snapshot, true).await.unwrap();
+        assert_eq!(again.fdroid.as_ref().unwrap().file("entry.jar"), fdroid.file("entry.jar"));
+        snapshot.releases[0].notes = "First, again.".into();
+        let changed = repos.build("pk", "org.example.hello", &snapshot, true).await.unwrap();
+        let index: serde_json::Value = serde_json::from_slice(changed.fdroid.as_ref().unwrap().file("index-v2.json").unwrap()).unwrap();
+        assert_eq!(index["repo"]["timestamp"], 100_001);
+        assert_eq!(changed.fdroid.as_ref().unwrap().fingerprint, fdroid.fingerprint);
     }
 
     #[test]

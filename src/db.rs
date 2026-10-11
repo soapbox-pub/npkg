@@ -1,6 +1,7 @@
 //! SQLite: the NIP-82 events the gateway follows, what each package file was
 //! found to be, which commit each Flatpak bundle carried, which file each
-//! package version is pinned to, and the key each NIP-05 address last named. With those, every repository is rebuilt
+//! package version is pinned to, how each F-Droid index was last dated and
+//! the icons they show, and the key each NIP-05 address last named. With those, every repository is rebuilt
 //! after a restart without the network.
 
 use std::collections::HashSet;
@@ -73,6 +74,20 @@ impl Db {
                -- The commit it carried, as JSON, or why it was refused.
                bundle TEXT,
                error TEXT
+             );
+             -- The last F-Droid index each repository served, by its hash
+             -- with no timestamp in it, and the timestamp it was given.
+             CREATE TABLE IF NOT EXISTS fdroid_indexes (
+               pubkey TEXT NOT NULL,
+               d TEXT NOT NULL,
+               sha256 TEXT NOT NULL,
+               timestamp INTEGER NOT NULL,
+               PRIMARY KEY (pubkey, d)
+             );
+             -- Applications' icons, for F-Droid, which wants their hashes.
+             CREATE TABLE IF NOT EXISTS icons (
+               url TEXT PRIMARY KEY,
+               data BLOB NOT NULL
              );
              DROP TABLE IF EXISTS snapshots;",
         )?;
@@ -184,6 +199,44 @@ impl Db {
             )
         })
         .await
+    }
+
+    /// The hash and timestamp of the last F-Droid index `pubkey`'s
+    /// application `d` served.
+    pub async fn fdroid_index(&self, pubkey: &str, d: &str) -> anyhow::Result<Option<(String, i64)>> {
+        let (pubkey, d) = (pubkey.to_string(), d.to_string());
+        self.call(move |conn| {
+            conn.query_row("SELECT sha256, timestamp FROM fdroid_indexes WHERE pubkey = ? AND d = ?", [pubkey, d], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn store_fdroid_index(&self, pubkey: &str, d: &str, sha256: &str, timestamp: i64) -> anyhow::Result<()> {
+        let args = [pubkey, d, sha256].map(str::to_string);
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO fdroid_indexes (pubkey, d, sha256, timestamp) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (pubkey, d) DO UPDATE SET sha256 = excluded.sha256, timestamp = excluded.timestamp",
+                params![args[0], args[1], args[2], timestamp],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The icon downloaded from `url`.
+    pub async fn icon(&self, url: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let url = url.to_string();
+        self.call(move |conn| conn.query_row("SELECT data FROM icons WHERE url = ?", [url], |row| row.get(0)).optional()).await
+    }
+
+    pub async fn store_icon(&self, url: &str, data: &[u8]) -> anyhow::Result<()> {
+        let (url, data) = (url.to_string(), data.to_vec());
+        self.call(move |conn| conn.execute("INSERT OR REPLACE INTO icons (url, data) VALUES (?, ?)", params![url, data])).await?;
+        Ok(())
     }
 
     /// The key `name@domain` last resolved to, and how long ago.

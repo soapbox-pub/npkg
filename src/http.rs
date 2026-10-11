@@ -1,6 +1,6 @@
 //! The routes. Every repository is addressed by its format first, then its
 //! application's author and `d` tag: `/apt/<owner>/<d>`, `/rpm/<owner>/<d>`,
-//! `/flatpak/<owner>/<d>`.
+//! `/flatpak/<owner>/<d>`, `/fdroid/<owner>/<d>`.
 //! The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
 //! `soapbox.pub` for `_@soapbox.pub`). The URLs a repository hands out keep
 //! the form they were asked for by, so a NIP-05 repository follows its name
@@ -32,7 +32,7 @@ use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
 use crate::ostree;
 use crate::repo::{CHANNELS, FlatpakChannel, Lookup, Release, Repo, Repos, channel_rank};
-use crate::{apt, nip82};
+use crate::{apt, fdroid, nip82};
 
 pub struct AppState {
     pub repos: Arc<Repos>,
@@ -61,6 +61,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/flatpak/{owner}/{d}/{file}", get(flatpak_setup))
         .route("/flatpak/{owner}/{d}/{channel}/{file}", get(flatpak_top))
         .route("/flatpak/{owner}/{d}/{channel}/objects/{prefix}/{file}", get(flatpak_object))
+        .route("/fdroid/{owner}/{d}", get(status))
+        .route("/fdroid/{owner}/{d}/repo", get(status))
+        .route("/fdroid/{owner}/{d}/repo/{file}", get(fdroid_file))
+        .route("/fdroid/{owner}/{d}/repo/{sha256}/{file}", get(fdroid_apk))
         .route("/releases/{owner}/{d}", get(releases))
         .route("/releases/{owner}/{d}/latest", get(latest_release))
         .route("/releases/{owner}/{d}/latest/download/{name}", get(latest_download))
@@ -185,9 +189,10 @@ async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> R
 async fn index(State(state): Shared) -> Response {
     let base = &state.public_url;
     let mut out = format!(
-        "npkg: apt and dnf repositories for software its team releases on Nostr (NIP-82).\n\n\
+        "npkg: apt, dnf, Flatpak and F-Droid repositories for software its team releases on Nostr (NIP-82).\n\n\
          apt:  {base}/apt/<owner>/<app-id>\n\
          dnf:  {base}/rpm/<owner>/<app-id>\n\
+         F-Droid:  {base}/fdroid/<owner>/<app-id>\n\
          releases, as JSON:  {base}/releases/<owner>/<app-id>, and /latest\n\
          a release's file:   {base}/releases/<owner>/<app-id>/latest/download/<filename>\n\
          The owner is an npub, or a NIP-05 address: alex@gleasonator.com, or soapbox.pub for _@soapbox.pub.\n\n\
@@ -253,6 +258,14 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
             d = segment(&repo.d)
         );
     }
+    if let Some(fdroid) = &repo.fdroid {
+        let _ = writeln!(
+            out,
+            "F-Droid (in Settings, Repositories, or open the link on the phone):\n  {}\n  fingerprint {}\n  Releases off the stable channel are in F-Droid's Beta channel.\n",
+            fdroid::setup_url(&fdroid.address, &fdroid.fingerprint),
+            fdroid.fingerprint
+        );
+    }
     let _ = writeln!(out, "Channels: {} (add ?channel=beta to any setup URL)", CHANNELS.join(", "));
     let _ = writeln!(out, "This repository serves whatever packages its author publishes, under any name.\n");
     let _ = writeln!(
@@ -279,7 +292,7 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
             "    {} {} {} [{}] {}",
             one_line(&package.meta.version()),
             package.meta.format().as_str(),
-            one_line(package.meta.arch()),
+            one_line(&package.meta.arch()),
             CHANNELS[package.channel],
             package.sha256
         );
@@ -302,7 +315,7 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
 }
 
 /// `d`, as one segment of a URL path.
-fn segment(d: &str) -> String {
+pub fn segment(d: &str) -> String {
     d.bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect()
@@ -454,10 +467,81 @@ async fn download(state: &AppState, client: IpAddr, owner: &str, d: &str, format
         Ok(found) => found,
         Err(response) => return response,
     };
-    match repo.download_url(format, sha256) {
-        Some(url) => Redirect::to(url).into_response(),
+    match repo.package(format, sha256) {
+        Some(package) => Redirect::to(&package.url).into_response(),
         None => error(StatusCode::NOT_FOUND, "This repository has no such package."),
     }
+}
+
+/// The F-Droid repository's index files, and the app's icon.
+async fn fdroid_file(State(state): Shared, Client(client): Client, Path((owner, d, file)): Path<(String, String, String)>) -> Response {
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let Some(fdroid) = &repo.fdroid else {
+        return error(StatusCode::NOT_FOUND, format!("{} has no APK in any release.", repo.name));
+    };
+    if let Some((_, icon)) = fdroid.icon.as_ref().filter(|(name, _)| *name == file) {
+        let content_type = match icon.as_slice() {
+            [0x89, b'P', b'N', b'G', ..] => "image/png",
+            [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+            [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+            _ => "application/octet-stream",
+        };
+        // Named by its hash, so it never changes.
+        return ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], icon.clone())
+            .into_response();
+    }
+    let content_type = match file.as_str() {
+        "entry.jar" => "application/java-archive",
+        "entry.json" | "index-v2.json" => "application/json",
+        _ => return error(StatusCode::NOT_FOUND, "There's no such file."),
+    };
+    match fdroid.file(&file) {
+        Some(body) => text(content_type, body.to_vec()),
+        None => error(StatusCode::NOT_FOUND, "There's no such file."),
+    }
+}
+
+/// An APK, passed on from where it's kept: F-Droid doesn't follow
+/// redirects. F-Droid checks it against the hash in the signed index.
+async fn fdroid_apk(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, sha256, _file)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let Some(package) = repo.package(Format::Apk, &sha256) else {
+        return error(StatusCode::NOT_FOUND, "This repository has no such APK.");
+    };
+    let range = headers.get(header::RANGE).and_then(|range| range.to_str().ok());
+    match state.repos.fetch(package, range).await {
+        Ok(response) => passed_on(response),
+        Err(error) => self::error(StatusCode::BAD_GATEWAY, format!("Couldn't fetch the APK from any server: {error:#}. Try again later.")),
+    }
+}
+
+/// An APK from upstream, streamed on.
+fn passed_on(upstream: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/vnd.android.package-archive")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+    for name in [header::CONTENT_LENGTH, header::CONTENT_RANGE, header::ACCEPT_RANGES] {
+        if let Some(value) = upstream.headers().get(name.as_str()).and_then(|value| header::HeaderValue::from_bytes(value.as_bytes()).ok())
+        {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| error(StatusCode::BAD_GATEWAY, "The upstream response couldn't be passed on."))
 }
 
 /// The app a channel's `.flatpakref` installs: the one named like the

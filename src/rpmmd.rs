@@ -20,7 +20,7 @@ pub fn render(packages: &[&Package], signer: &Signer) -> anyhow::Result<HashMap<
         .iter()
         .filter_map(|package| match &package.meta {
             Meta::Rpm(meta) => Some((*package, &**meta)),
-            Meta::Deb(_) => None,
+            Meta::Deb(_) | Meta::Apk(_) => None,
         })
         .collect();
     let count = rpms.len();

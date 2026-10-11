@@ -8,6 +8,8 @@
 mod apt;
 mod config;
 mod db;
+mod der;
+mod fdroid;
 mod gvariant;
 mod http;
 mod inspect;
@@ -77,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             let db = db::Db::open(&config.database_path())?;
             let names = nostr::nip05::Resolver::new(db.clone(), config.authors.clone())?;
             let store = ostree::Store::open(&config.ostree_path())?;
-            let repos = repo::Repos::new(config.blossom_servers.clone(), db.clone(), store, signer)?;
+            let repos = repo::Repos::new(config.public_url.clone(), config.blossom_servers.clone(), db.clone(), store, signer)?;
             sync::Worker {
                 relays: config.relays.clone(),
                 authors: config.authors.clone(),

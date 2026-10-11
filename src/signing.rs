@@ -15,15 +15,18 @@ use pgp::composed::{
     ArmorOptions, CleartextSignedMessage, Deserializable, DetachedSignature, EncryptionCaps, KeyType, SecretKeyParamsBuilder,
     SignedPublicKey, SignedSecretKey,
 };
+use pgp::crypto::eddsa_legacy;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::ser::Serialize;
-use pgp::types::{KeyDetails, Password};
+use pgp::types::{KeyDetails, Password, PlainSecretParams, SecretParams};
 
 pub struct Signer {
     key: SignedSecretKey,
     public: String,
     /// The public key in binary, which Flatpak's `GPGKey=` wants in base64.
     public_binary: Vec<u8>,
+    /// The Ed25519 secret, which other keys are derived from.
+    secret: [u8; 32],
 }
 
 impl Signer {
@@ -43,7 +46,11 @@ impl Signer {
         let public_key = SignedPublicKey::from(key.clone());
         let public = public_key.to_armored_string(ArmorOptions::default())?;
         let public_binary = public_key.to_bytes()?;
-        Ok(Signer { key, public, public_binary })
+        let secret = match key.primary_key.secret_params() {
+            SecretParams::Plain(PlainSecretParams::EdDSALegacy(eddsa_legacy::SecretKey::Ed25519(secret))) => *secret.as_bytes(),
+            _ => anyhow::bail!("The signing key isn't an unencrypted Ed25519 key, as `npkg keygen` makes."),
+        };
+        Ok(Signer { key, public, public_binary, secret })
     }
 
     /// Make a key and write it to `path`, which must not exist yet: a
@@ -77,6 +84,18 @@ impl Signer {
 
     pub fn fingerprint(&self) -> String {
         self.key.fingerprint().to_string()
+    }
+
+    /// A secret for `label` that only this key's holder can make, and that
+    /// is the same every time: other keys are derived from it, so that
+    /// there is still only one key to back up.
+    pub fn derive(&self, label: &[u8]) -> [u8; 32] {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"npkg derived secret\0");
+        hasher.update(self.secret);
+        hasher.update(label);
+        hasher.finalize().into()
     }
 
     /// `text`, as a cleartext-signed message: an InRelease file.
