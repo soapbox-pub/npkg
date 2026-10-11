@@ -52,7 +52,7 @@ pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], si
     // the same packages is the same file.
     let date = packages.iter().map(|package| package.created_at).max().unwrap_or(0);
     let release = format!(
-        "Origin: npkg-gateway\nLabel: {d}\nSuite: {suite}\nCodename: {suite}\nDate: {}\nArchitectures: {}\nComponents: main\nDescription: {}\nSHA256:\n{sums}",
+        "Origin: npkg\nLabel: {d}\nSuite: {suite}\nCodename: {suite}\nDate: {}\nArchitectures: {}\nComponents: main\nDescription: {}\nSHA256:\n{sums}",
         rfc2822(date),
         ARCHES.join(" "),
         crate::nip82::one_line(description),

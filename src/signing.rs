@@ -37,7 +37,7 @@ impl Signer {
             mode & 0o777
         );
         let armored = std::fs::read_to_string(path)
-            .with_context(|| format!("Couldn't read the signing key at {}. Make one with `npkg-gateway keygen`.", path.display()))?;
+            .with_context(|| format!("Couldn't read the signing key at {}. Make one with `npkg keygen`.", path.display()))?;
         let (key, _) = SignedSecretKey::from_string(&armored).context("The signing key isn't an armored OpenPGP secret key.")?;
         key.verify_bindings().context("The signing key's self-signatures don't verify.")?;
         let public_key = SignedPublicKey::from(key.clone());

@@ -1,9 +1,9 @@
 //! The configuration file: TOML, from the path `--config` names, or else the
-//! first of `$XDG_CONFIG_HOME/npkg-gateway/npkg-gateway.toml`
+//! first of `$XDG_CONFIG_HOME/npkg/npkg.toml`
 //! (`~/.config/...`) and [`SYSTEM_PATH`] that exists. A file `--config` names
 //! has to exist, since naming it meant something.
 //!
-//! `npkg-gateway.example.toml` lists every key with its default. Only
+//! `npkg.example.toml` lists every key with its default. Only
 //! `public_url` and `authors` are required.
 
 use std::collections::HashSet;
@@ -17,9 +17,9 @@ use serde::Deserialize;
 use crate::nostr::nip19;
 
 /// Where a packaged gateway's configuration is.
-pub const SYSTEM_PATH: &str = "/etc/npkg-gateway/npkg-gateway.toml";
+pub const SYSTEM_PATH: &str = "/etc/npkg/npkg.toml";
 /// `data_dir` when the file doesn't say, for root.
-const SYSTEM_DATA_DIR: &str = "/var/lib/npkg-gateway";
+const SYSTEM_DATA_DIR: &str = "/var/lib/npkg";
 
 const DEFAULT_RELAYS: [&str; 5] =
     ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"];
@@ -91,7 +91,7 @@ impl Environment {
     /// The files looked for when `--config` names none, in the order tried.
     pub fn config_candidates(&self) -> Vec<PathBuf> {
         let user = self.xdg_config_home.clone().or_else(|| self.home.as_ref().map(|home| home.join(".config")));
-        user.map(|dir| dir.join("npkg-gateway/npkg-gateway.toml")).into_iter().chain([PathBuf::from(SYSTEM_PATH)]).collect()
+        user.map(|dir| dir.join("npkg/npkg.toml")).into_iter().chain([PathBuf::from(SYSTEM_PATH)]).collect()
     }
 
     fn default_data_dir(&self) -> Result<PathBuf> {
@@ -99,7 +99,7 @@ impl Environment {
             return Ok(PathBuf::from(SYSTEM_DATA_DIR));
         }
         match self.xdg_data_home.clone().or_else(|| self.home.as_ref().map(|home| home.join(".local/share"))) {
-            Some(dir) => Ok(dir.join("npkg-gateway")),
+            Some(dir) => Ok(dir.join("npkg")),
             None => bail!("Neither HOME nor XDG_DATA_HOME is set, so there is no default place to keep data. Set data_dir."),
         }
     }
@@ -195,7 +195,7 @@ impl Config {
 
     /// Path of the SQLite database file.
     pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join("npkg-gateway.sqlite")
+        self.data_dir.join("npkg.sqlite")
     }
 
     /// Directory of the OSTree object store Flatpak remotes are served from.
@@ -212,7 +212,7 @@ impl Config {
 fn not_found(env: &Environment) -> anyhow::Error {
     let tried: Vec<String> = env.config_candidates().iter().map(|path| path.display().to_string()).collect();
     anyhow!(
-        "No config file at {}. Write one with public_url and authors set (npkg-gateway.example.toml lists every setting), or name one with --config.",
+        "No config file at {}. Write one with public_url and authors set (npkg.example.toml lists every setting), or name one with --config.",
         tried.join(" or ")
     )
 }
@@ -256,7 +256,7 @@ mod tests {
         let c = config(r#"public_url = "https://pkg.example.com/""#).unwrap();
         assert_eq!(c.public_url, "https://pkg.example.com");
         assert_eq!(c.bind.to_string(), "127.0.0.1:8080");
-        assert_eq!(c.data_dir, Path::new("/home/someone/.local/share/npkg-gateway"));
+        assert_eq!(c.data_dir, Path::new("/home/someone/.local/share/npkg"));
         assert_eq!(c.relays, DEFAULT_RELAYS);
         assert_eq!(c.blossom_servers, DEFAULT_BLOSSOM_SERVERS);
         assert_eq!(c.resync_interval, Duration::from_secs(3600));
@@ -277,11 +277,11 @@ mod tests {
     #[test]
     fn data_dir_is_relative_to_the_file() {
         let c = config("public_url = \"http://x\"\ndata_dir = \"data\"").unwrap();
-        assert_eq!(c.data_dir, Path::new("/etc/npkg-gateway/data"));
-        assert_eq!(c.database_path(), Path::new("/etc/npkg-gateway/data/npkg-gateway.sqlite"));
+        assert_eq!(c.data_dir, Path::new("/etc/npkg/data"));
+        assert_eq!(c.database_path(), Path::new("/etc/npkg/data/npkg.sqlite"));
         let root = Environment { root: true, ..env() };
         let file: File = toml::from_str(&format!("public_url = \"http://x\"\nauthors = [\"{NPUB}\"]")).unwrap();
-        assert_eq!(Config::from_file(file, "/x/npkg-gateway.toml".into(), &root).unwrap().data_dir, Path::new(SYSTEM_DATA_DIR));
+        assert_eq!(Config::from_file(file, "/x/npkg.toml".into(), &root).unwrap().data_dir, Path::new(SYSTEM_DATA_DIR));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn the_example_is_valid() {
-        let c = config(include_str!("../npkg-gateway.example.toml")).unwrap();
+        let c = config(include_str!("../npkg.example.toml")).unwrap();
         assert_eq!(c.public_url, "https://pkg.example.com");
     }
 
@@ -317,17 +317,17 @@ mod tests {
     fn finds_the_user_config_first() {
         let dir = tempfile::tempdir().unwrap();
         let env = Environment { xdg_config_home: Some(dir.path().into()), ..env() };
-        assert_eq!(env.config_candidates(), [dir.path().join("npkg-gateway/npkg-gateway.toml"), PathBuf::from(SYSTEM_PATH)]);
+        assert_eq!(env.config_candidates(), [dir.path().join("npkg/npkg.toml"), PathBuf::from(SYSTEM_PATH)]);
 
-        std::fs::create_dir(dir.path().join("npkg-gateway")).unwrap();
+        std::fs::create_dir(dir.path().join("npkg")).unwrap();
         std::fs::write(
-            dir.path().join("npkg-gateway/npkg-gateway.toml"),
+            dir.path().join("npkg/npkg.toml"),
             format!("public_url = \"http://mine\"\ndata_dir = \"d\"\nauthors = [\"{NPUB}\"]"),
         )
         .unwrap();
         let c = Config::load(None, &env).unwrap();
         assert_eq!(c.public_url, "http://mine");
-        assert_eq!(c.data_dir, dir.path().join("npkg-gateway/d"));
+        assert_eq!(c.data_dir, dir.path().join("npkg/d"));
     }
 
     #[test]

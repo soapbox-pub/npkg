@@ -1625,7 +1625,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "npkg-gateway"
+name = "npkg"
 version = "0.1.0"
 dependencies = [
  "anyhow",

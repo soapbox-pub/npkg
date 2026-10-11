@@ -185,7 +185,7 @@ async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> R
 async fn index(State(state): Shared) -> Response {
     let base = &state.public_url;
     let mut out = format!(
-        "npkg-gateway: apt and dnf repositories for software its team releases on Nostr (NIP-82).\n\n\
+        "npkg: apt and dnf repositories for software its team releases on Nostr (NIP-82).\n\n\
          apt:  {base}/apt/<owner>/<app-id>\n\
          dnf:  {base}/rpm/<owner>/<app-id>\n\
          releases, as JSON:  {base}/releases/<owner>/<app-id>, and /latest\n\
@@ -349,7 +349,7 @@ async fn apt_source(
     text(
         "text/plain; charset=utf-8",
         format!(
-            "# {}, from npkg-gateway\nTypes: deb\nURIs: {}/apt/{}/{}\nSuites: {channel}\nComponents: main\nSigned-By:\n{key}",
+            "# {}, from npkg\nTypes: deb\nURIs: {}/apt/{}/{}\nSuites: {channel}\nComponents: main\nSigned-By:\n{key}",
             repo.name,
             state.public_url,
             owner,
@@ -403,7 +403,7 @@ async fn rpm_repo(
     text(
         "text/plain; charset=utf-8",
         format!(
-            "[{id}]\nname={name} ({channel}, from npkg-gateway)\nbaseurl={base}/rpm/{owner}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
+            "[{id}]\nname={name} ({channel}, from npkg)\nbaseurl={base}/rpm/{owner}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
             id = file_stem(&repo.d),
             d = segment(&repo.d),
             name = repo.name,
@@ -496,7 +496,7 @@ async fn flatpak_setup(
     if file.ends_with(".flatpakrepo") {
         return text(
             "application/vnd.flatpak.repo",
-            format!("[Flatpak Repo]\nTitle={title} ({channel}, from npkg-gateway)\nUrl={url}\nGPGKey={key}\n"),
+            format!("[Flatpak Repo]\nTitle={title} ({channel}, from npkg)\nUrl={url}\nGPGKey={key}\n"),
         );
     }
     if !file.ends_with(".flatpakref") {

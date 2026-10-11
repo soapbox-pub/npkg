@@ -1,4 +1,4 @@
-# npkg-gateway
+# npkg
 
 apt, dnf and Flatpak repositories for software a team releases on Nostr
 (NIP-82).
@@ -18,7 +18,7 @@ deployed yet, so there's no backwards compatibility to keep.
 ```
 src/
   main.rs        the CLI: keygen, serve
-  config.rs      the TOML config file (npkg-gateway.example.toml)
+  config.rs      the TOML config file (npkg.example.toml)
   sync.rs        the sync worker: builds at startup from stored events,
                  follows the team live, resyncs every resync_interval
   http.rs        the routes, setup files, the status page, and release JSON
@@ -110,14 +110,14 @@ What the unit tests can't show is whether apt and dnf accept the result. To
 check that, run the gateway and install a real package in containers:
 
 ```sh
-cat > npkg-gateway.toml <<'EOF'   # once; gitignored
+cat > npkg.toml <<'EOF'   # once; gitignored
 public_url = "http://127.0.0.1:8099"
 bind = "127.0.0.1:8099"
 data_dir = "data"
 authors = ["npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj"]
 EOF
-cargo run -- -c npkg-gateway.toml keygen   # once
-cargo run -- -c npkg-gateway.toml serve
+cargo run -- -c npkg.toml keygen   # once
+cargo run -- -c npkg.toml serve
 N=npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj
 podman run --rm --network host docker.io/library/debian:trixie bash -c "
   apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null &&

@@ -1,4 +1,4 @@
-# npkg-gateway
+# npkg
 
 apt, dnf and Flatpak repositories for software a team releases on Nostr.
 
@@ -207,16 +207,16 @@ Blossom servers themselves may be anywhere: they're the operator's.
 
 ```sh
 cargo build --release
-sudo install -D -m 644 npkg-gateway.example.toml /etc/npkg-gateway/npkg-gateway.toml
-sudoedit /etc/npkg-gateway/npkg-gateway.toml   # set public_url and authors
-sudo ./target/release/npkg-gateway keygen
-sudo ./target/release/npkg-gateway serve
+sudo install -D -m 644 npkg.example.toml /etc/npkg/npkg.toml
+sudoedit /etc/npkg/npkg.toml   # set public_url and authors
+sudo ./target/release/npkg keygen
+sudo ./target/release/npkg serve
 ```
 
 The config file is the one `--config` names, or else the first of
-`~/.config/npkg-gateway/npkg-gateway.toml` and
-`/etc/npkg-gateway/npkg-gateway.toml`. `public_url` and `authors`, the npubs
-on the team, are required; `npkg-gateway.example.toml` lists every setting
+`~/.config/npkg/npkg.toml` and
+`/etc/npkg/npkg.toml`. `public_url` and `authors`, the npubs
+on the team, are required; `npkg.example.toml` lists every setting
 (the listen address, relays, Blossom servers, resync interval) with its
 default. An author taken off the list has their events forgotten at the next
 start.
@@ -227,7 +227,7 @@ downloads are redirects to Blossom. A `.flatpak` is unpacked into
 `data_dir/ostree`, which Flatpak remotes are served from, and that takes
 disk: about one copy of each app, plus what changed in each release.
 
-`keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
+`keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg`
 as root) once, readable only by its owner; the gateway refuses to start if
 anyone else can read it. Back it up: every user's setup trusts that key.
 

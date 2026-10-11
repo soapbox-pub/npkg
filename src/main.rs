@@ -1,4 +1,4 @@
-//! npkg-gateway: apt and dnf repositories for software released on Nostr.
+//! npkg: apt and dnf repositories for software released on Nostr.
 //!
 //! Each NIP-82 application the team publishes gets its own repository at
 //! `/apt/<owner>/<d>` and `/rpm/<owner>/<d>`, where the owner is its author's
@@ -34,9 +34,9 @@ use crate::config::Config;
 #[command(version, about)]
 struct Cli {
     /// Configuration file [default: the first that exists of
-    /// $XDG_CONFIG_HOME/npkg-gateway/npkg-gateway.toml
-    /// (~/.config/npkg-gateway/npkg-gateway.toml) and
-    /// /etc/npkg-gateway/npkg-gateway.toml]
+    /// $XDG_CONFIG_HOME/npkg/npkg.toml
+    /// (~/.config/npkg/npkg.toml) and
+    /// /etc/npkg/npkg.toml]
     #[arg(short, long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -48,7 +48,7 @@ enum Command {
     /// Make the gateway's signing key. Once only: users trust it.
     Keygen {
         /// The key's user ID.
-        #[arg(long, default_value = "npkg-gateway")]
+        #[arg(long, default_value = "npkg")]
         user_id: String,
     },
     /// Serve repositories.

@@ -1,6 +1,6 @@
-# npkg-gateway configuration. The gateway reads the file --config names, or
-# else the first of ~/.config/npkg-gateway/npkg-gateway.toml and
-# /etc/npkg-gateway/npkg-gateway.toml.
+# npkg configuration. The gateway reads the file --config names, or
+# else the first of ~/.config/npkg/npkg.toml and
+# /etc/npkg/npkg.toml.
 #
 # Only public_url and authors are required; the rest are shown with their
 # defaults. A key the gateway doesn't know is refused.
@@ -12,10 +12,10 @@ public_url = "https://pkg.example.com"
 # The address and port to listen on. A reverse proxy terminates TLS in front.
 # bind = "127.0.0.1:8080"
 
-# Holds npkg-gateway.sqlite and signing-key.asc. A relative path is relative
-# to this file. Defaults to /var/lib/npkg-gateway as root, else
-# ~/.local/share/npkg-gateway.
-# data_dir = "/var/lib/npkg-gateway"
+# Holds npkg.sqlite and signing-key.asc. A relative path is relative
+# to this file. Defaults to /var/lib/npkg as root, else
+# ~/.local/share/npkg.
+# data_dir = "/var/lib/npkg"
 
 # Relays to follow NIP-82 events on.
 # relays = ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"]

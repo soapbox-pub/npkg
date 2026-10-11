@@ -235,7 +235,7 @@ impl Repos {
         // like: only the configured servers may be private.
         let trusted = blossom.iter().filter_map(|server| reqwest::Url::parse(server).ok()?.host_str().map(str::to_string));
         let http = reqwest::Client::builder()
-            .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("npkg/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .redirect(net::redirect_policy())

@@ -130,7 +130,7 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(db: Db, team: HashSet<String>) -> anyhow::Result<Arc<Resolver>> {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("npkg/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             // NIP-05: fetchers must ignore redirects.

@@ -1,4 +1,4 @@
-# The Rust that builds npkg-gateway, here and in CI alike. rustup reads
+# The Rust that builds npkg, here and in CI alike. rustup reads
 # this and installs it on first use. Pinned rather than `stable` so a release
 # is built by the compiler its tests ran on, and so a newer stable can't
 # quietly invalidate every cached build.
