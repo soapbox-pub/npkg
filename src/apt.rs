@@ -55,7 +55,7 @@ pub fn render(suite: &str, d: &str, description: &str, packages: &[&Package], si
         "Origin: npkg-gateway\nLabel: {d}\nSuite: {suite}\nCodename: {suite}\nDate: {}\nArchitectures: {}\nComponents: main\nDescription: {}\nSHA256:\n{sums}",
         rfc2822(date),
         ARCHES.join(" "),
-        description.replace('\n', " "),
+        crate::nip82::one_line(description),
     );
     files.insert("InRelease".into(), signer.sign_cleartext(&release)?.into_bytes());
     files.insert("Release.gpg".into(), signer.sign_detached(release.as_bytes())?.into_bytes());

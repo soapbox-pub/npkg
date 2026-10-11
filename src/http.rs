@@ -27,6 +27,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::inspect::Format;
+use crate::nip82::one_line;
 use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
 use crate::ostree;
@@ -171,14 +172,7 @@ async fn index(State(state): Shared) -> Response {
         let _ = writeln!(out, "  none yet");
     }
     for repo in repos {
-        let _ = writeln!(
-            out,
-            "  {} ({}): {base}/apt/{}/{}",
-            repo.name.replace('\n', " "),
-            repo.d,
-            nip19::npub_encode(&repo.pubkey),
-            segment(&repo.d)
-        );
+        let _ = writeln!(out, "  {} ({}): {base}/apt/{}/{}", repo.name, repo.d, nip19::npub_encode(&repo.pubkey), segment(&repo.d));
     }
     text("text/plain; charset=utf-8", out)
 }
@@ -250,15 +244,15 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
     for package in packages {
         let name = package.meta.name();
         if previous != Some(name) {
-            let _ = writeln!(out, "  {name}");
+            let _ = writeln!(out, "  {}", one_line(name));
             previous = Some(name);
         }
         let _ = writeln!(
             out,
             "    {} {} {} [{}] {}",
-            package.meta.version(),
+            one_line(&package.meta.version()),
             package.meta.format().as_str(),
-            package.meta.arch(),
+            one_line(package.meta.arch()),
             CHANNELS[package.channel],
             package.sha256
         );
@@ -267,14 +261,14 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
         let _ = writeln!(out, "\nFlatpak:");
         for (rank, channel) in CHANNELS.iter().enumerate() {
             for head in repo.flatpak(rank).map_or(&[][..], |channel| &channel.refs[..]) {
-                let _ = writeln!(out, "  {channel}: {} from {} ({})", head.bundle.ref_name, head.release, head.bundle.commit);
+                let _ = writeln!(out, "  {channel}: {} from {} ({})", head.bundle.ref_name, one_line(&head.release), head.bundle.commit);
             }
         }
     }
     if !repo.rejections.is_empty() {
         let _ = writeln!(out, "\nLeft out:");
         for rejection in &repo.rejections {
-            let _ = writeln!(out, "  {} {}: {}", rejection.release, rejection.sha256, rejection.reason);
+            let _ = writeln!(out, "  {} {}: {}", one_line(&rejection.release), rejection.sha256, one_line(&rejection.reason));
         }
     }
     text("text/plain; charset=utf-8", out)
@@ -385,7 +379,7 @@ async fn rpm_repo(
             "[{id}]\nname={name} ({channel}, from npkg-gateway)\nbaseurl={base}/rpm/{owner}/{d}/{channel}\nenabled=1\nrepo_gpgcheck=1\ngpgcheck=0\ngpgkey={base}/key.asc\n",
             id = file_stem(&repo.d),
             d = segment(&repo.d),
-            name = repo.name.replace('\n', " "),
+            name = repo.name,
             base = state.public_url,
         ),
     )
@@ -469,7 +463,7 @@ async fn flatpak_setup(
     };
     let url = format!("{}/flatpak/{owner}/{}/{channel}/", state.public_url, segment(&repo.d));
     let key = base64::engine::general_purpose::STANDARD.encode(state.repos.signer().public_key_binary());
-    let title = repo.name.replace('\n', " ");
+    let title = &repo.name;
     // Remote names are what `flatpak remotes` lists: one per channel.
     let remote_name = if rank == 0 { file_stem(&repo.d) } else { format!("{}-{channel}", file_stem(&repo.d)) };
     if file.ends_with(".flatpakrepo") {

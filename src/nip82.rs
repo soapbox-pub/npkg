@@ -115,7 +115,7 @@ pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
         .iter()
         .filter(|event| event.kind == APPLICATION && event.tag("d") == Some(d))
         .max_by_key(|event| (event.created_at, std::cmp::Reverse(event.id.clone())))
-        .map(|event| Application { name: event.tag("name").map(str::to_string), summary: event.tag("summary").map(str::to_string) });
+        .map(|event| Application { name: event.tag("name").map(one_line), summary: event.tag("summary").map(one_line) });
 
     // Releases are addressable: of each `d`, the newest stands.
     let mut newest: HashMap<&str, &Event> = HashMap::new();
@@ -152,6 +152,14 @@ pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
     releases.sort_by(|a, b| (a.created_at, &a.version).cmp(&(b.created_at, &b.version)));
 
     Snapshot { application, releases }
+}
+
+/// `text` with every control character, line breaks included, made a
+/// space. What an author writes ends up in setup files, where a line break
+/// would start a field or a whole repository of the author's choosing, and
+/// on the status page, above the commands people copy.
+pub fn one_line(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 fn parse_asset(event: &Event) -> Option<Asset> {
@@ -334,7 +342,7 @@ pub mod tests {
             ]),
             "notes",
         );
-        let application = Event::sign(secret, created_at, APPLICATION, tags(&[&["d", "app"], &["name", "App"]]), "");
+        let application = Event::sign(secret, created_at, APPLICATION, tags(&[&["d", "app"], &["name", "App\n\nTypes:\r"]]), "");
         vec![asset, release, application]
     }
 
@@ -356,7 +364,8 @@ pub mod tests {
 
         assert_eq!(applications(&events, &alice), BTreeSet::from(["app".to_string()]));
         let snapshot = snapshot(&events, &alice, "app");
-        assert_eq!(snapshot.application.unwrap().name.as_deref(), Some("App"));
+        // Its name is one line, whatever the author wrote.
+        assert_eq!(snapshot.application.unwrap().name.as_deref(), Some("App  Types: "));
         let versions: Vec<&str> = snapshot.releases.iter().map(|release| release.version.as_str()).collect();
         assert_eq!(versions, ["1.0", "1.1"]);
         assert_eq!(snapshot.releases[0].assets.len(), 1);

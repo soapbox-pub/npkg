@@ -72,6 +72,11 @@ pub fn inspect(bytes: &[u8]) -> anyhow::Result<DebMeta> {
 pub fn parse_control(text: &str) -> anyhow::Result<DebMeta> {
     let mut fields: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
+        // A carriage return, say, could read as a line break to whatever
+        // reads the Packages file the fields are copied into.
+        if line.chars().any(|c| c.is_control() && c != '\t') {
+            bail!("The control file has a control character in the line {line:?}.");
+        }
         if line.trim().is_empty() {
             if fields.is_empty() {
                 continue;
@@ -203,6 +208,8 @@ pub mod tests {
         assert!(parse_control("Package: x\nPackage: y\nVersion: 1\nArchitecture: all\n").is_err());
         assert!(parse_control(" continuation\nPackage: x\n").is_err());
         assert!(parse_control("Package: x\njunk\n").is_err());
+        assert!(parse_control("Package: x\nVersion: 1\rFilename: y\nArchitecture: all\n").is_err());
+        assert!(parse_control("Package: x\r\nVersion: 1\r\nArchitecture: all\r\n").is_ok());
     }
 
     #[test]
