@@ -1,5 +1,5 @@
-//! Nostr: events, NIP-19 identifiers, NIP-05 addresses, and one-shot relay
-//! queries.
+//! Nostr: events, NIP-19 identifiers, NIP-05 addresses, and relay queries
+//! and subscriptions.
 
 pub mod event;
 pub mod nip05;

@@ -1,8 +1,9 @@
-//! SQLite: what each package file was found to be, which file each package
-//! version is pinned to, the key each NIP-05 address last named, and what
-//! relays last said about each application. With those, a repository is
-//! rebuilt after a restart without the network.
+//! SQLite: the NIP-82 events the gateway follows, what each package file was
+//! found to be, which file each package version is pinned to, and the key
+//! each NIP-05 address last named. With those, every repository is rebuilt
+//! after a restart without the network.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::inspect::{Format, Meta};
-use crate::nip82::Snapshot;
+use crate::nostr::Event;
 
 #[derive(Clone)]
 pub struct Db {
@@ -56,13 +57,17 @@ impl Db {
                resolved_at INTEGER NOT NULL,
                PRIMARY KEY (name, domain)
              );
-             CREATE TABLE IF NOT EXISTS snapshots (
+             CREATE TABLE IF NOT EXISTS events (
+               id TEXT PRIMARY KEY,
                pubkey TEXT NOT NULL,
-               d TEXT NOT NULL,
-               fetched_at INTEGER NOT NULL,
-               snapshot TEXT NOT NULL,
-               PRIMARY KEY (pubkey, d)
-             );",
+               kind INTEGER NOT NULL,
+               -- An addressable event's d tag; NULL for any other.
+               d TEXT,
+               created_at INTEGER NOT NULL,
+               json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS events_by_address ON events (pubkey, kind, d);
+             DROP TABLE IF EXISTS snapshots;",
         )?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
@@ -172,32 +177,69 @@ impl Db {
         Ok(())
     }
 
-    /// What relays last said about `pubkey`'s application `d`, and how long
-    /// ago. One stored by an older gateway that no longer reads is an error.
-    pub async fn snapshot(&self, pubkey: &str, d: &str) -> anyhow::Result<Option<(Snapshot, Duration)>> {
-        let (pubkey, d) = (pubkey.to_string(), d.to_string());
-        let row = self
-            .call(move |conn| {
-                conn.query_row("SELECT snapshot, fetched_at FROM snapshots WHERE pubkey = ? AND d = ?", [pubkey, d], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })
-                .optional()
+    /// Store whichever of `events` are new, and return how many were. Of
+    /// addressable events (kinds 30000-39999) only the newest for each
+    /// address is kept, as NIP-01 has relays do.
+    pub async fn store_events(&self, events: Vec<Event>) -> anyhow::Result<usize> {
+        let rows = events
+            .into_iter()
+            .map(|event| {
+                let d = (30000..40000).contains(&event.kind).then(|| event.tag("d").unwrap_or_default().to_string());
+                Ok((serde_json::to_string(&event)?, d, event))
             })
-            .await?;
-        row.map(|(snapshot, fetched_at)| Ok((serde_json::from_str(&snapshot)?, age(fetched_at)))).transpose()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.call(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stored = 0;
+            for (json, d, event) in rows {
+                if let Some(d) = &d {
+                    // NIP-01: the newest wins, and of two as new, the lower id.
+                    let newer: bool = tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM events WHERE pubkey = ? AND kind = ? AND d = ?
+                           AND (created_at > ? OR (created_at = ? AND id <= ?)))",
+                        params![event.pubkey, event.kind, d, event.created_at, event.created_at, event.id],
+                        |row| row.get(0),
+                    )?;
+                    if newer {
+                        continue;
+                    }
+                    tx.execute("DELETE FROM events WHERE pubkey = ? AND kind = ? AND d = ?", params![event.pubkey, event.kind, d])?;
+                }
+                stored += tx.execute(
+                    "INSERT OR IGNORE INTO events (id, pubkey, kind, d, created_at, json) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![event.id, event.pubkey, event.kind, d, event.created_at, json],
+                )?;
+            }
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
     }
 
-    pub async fn store_snapshot(&self, pubkey: &str, d: &str, snapshot: &Snapshot) -> anyhow::Result<()> {
-        let args = [pubkey.to_string(), d.to_string(), serde_json::to_string(snapshot)?];
+    /// Every stored event by `pubkey`.
+    pub async fn events(&self, pubkey: &str) -> anyhow::Result<Vec<Event>> {
+        let pubkey = pubkey.to_string();
+        let rows: Vec<String> = self
+            .call(move |conn| conn.prepare("SELECT json FROM events WHERE pubkey = ?")?.query_map([pubkey], |row| row.get(0))?.collect())
+            .await?;
+        // A row this gateway wrote is always readable; skip one that isn't
+        // rather than lose the rest.
+        Ok(rows.iter().filter_map(|json| serde_json::from_str(json).ok()).collect())
+    }
+
+    /// Delete the events of every author not in `authors`.
+    pub async fn forget_authors_except(&self, authors: &HashSet<String>) -> anyhow::Result<usize> {
+        let authors = authors.clone();
         self.call(move |conn| {
-            conn.execute(
-                "INSERT INTO snapshots (pubkey, d, fetched_at, snapshot) VALUES (?, ?, ?, ?)
-                 ON CONFLICT (pubkey, d) DO UPDATE SET fetched_at = excluded.fetched_at, snapshot = excluded.snapshot",
-                params![args[0], args[1], unix_now(), args[2]],
-            )
+            let stored: Vec<String> =
+                conn.prepare("SELECT DISTINCT pubkey FROM events")?.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            let mut forgotten = 0;
+            for pubkey in stored.iter().filter(|pubkey| !authors.contains(*pubkey)) {
+                forgotten += conn.execute("DELETE FROM events WHERE pubkey = ?", [pubkey])?;
+            }
+            Ok(forgotten)
         })
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -208,4 +250,34 @@ fn unix_now() -> i64 {
 /// How long ago a stored Unix time was.
 fn age(then: i64) -> Duration {
     Duration::from_secs(unix_now().saturating_sub(then).max(0) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nip82::{self, tests::published};
+
+    #[tokio::test]
+    async fn keeps_the_newest_of_each_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let secret = "0000000000000000000000000000000000000000000000000000000000000001";
+        let old = published(secret, "1.0", 100);
+        let new = published(secret, "1.0", 200);
+        let pubkey = old[0].pubkey.clone();
+
+        assert_eq!(db.store_events(old.clone()).await.unwrap(), 3);
+        assert_eq!(db.store_events(old.clone()).await.unwrap(), 0);
+        // The newer release and application replace the old; both assets stay.
+        assert_eq!(db.store_events(new.clone()).await.unwrap(), 3);
+        assert_eq!(db.store_events(old).await.unwrap(), 0);
+        let stored = db.events(&pubkey).await.unwrap();
+        assert_eq!(stored.len(), 4);
+        let release = stored.iter().find(|event| event.kind == nip82::RELEASE).unwrap();
+        assert_eq!(release.created_at, 200);
+
+        assert_eq!(db.forget_authors_except(&HashSet::from([pubkey.clone()])).await.unwrap(), 0);
+        assert_eq!(db.forget_authors_except(&HashSet::new()).await.unwrap(), 4);
+        assert!(db.events(&pubkey).await.unwrap().is_empty());
+    }
 }

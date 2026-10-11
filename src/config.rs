@@ -4,7 +4,7 @@
 //! has to exist, since naming it meant something.
 //!
 //! `npkg-gateway.example.toml` lists every key with its default. Only
-//! `public_url` is required.
+//! `public_url` and `authors` are required.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -41,17 +41,18 @@ pub struct Config {
     /// Blossom servers to look for package files on, when the URL an asset
     /// names doesn't serve it.
     pub blossom_servers: Vec<String>,
-    /// How long a repository, or a NIP-05 lookup, is served before it's
-    /// redone.
-    pub ttl: Duration,
+    /// How often everything is fetched from relays again, in case the live
+    /// subscription missed something.
+    pub resync_interval: Duration,
     /// What to log, as `tracing_subscriber`'s `EnvFilter` directives.
     pub log: String,
-    /// The hex pubkeys whose repositories are served, or `None` for anyone's.
-    pub authors: Option<HashSet<String>>,
+    /// The hex pubkeys whose applications are followed and served.
+    pub authors: HashSet<String>,
 }
 
-/// The file as written. Every key is optional but `public_url`, and a key the
-/// gateway doesn't know is refused rather than ignored, since it's a typo.
+/// The file as written. Every key is optional but `public_url` and
+/// `authors`, and a key the gateway doesn't know is refused rather than
+/// ignored, since it's a typo.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
@@ -60,7 +61,7 @@ struct File {
     data_dir: Option<PathBuf>,
     relays: Option<Vec<String>>,
     blossom_servers: Option<Vec<String>>,
-    ttl: Option<u64>,
+    resync_interval: Option<u64>,
     log: Option<String>,
     authors: Option<Vec<String>>,
 }
@@ -157,9 +158,9 @@ impl Config {
             bail!("blossom_servers must be http or https URLs, and {server:?} is not.");
         }
 
-        let ttl = match file.ttl {
-            Some(0) => bail!("ttl must be at least 1 second."),
-            ttl => Duration::from_secs(ttl.unwrap_or(300)),
+        let resync_interval = match file.resync_interval {
+            Some(seconds) if seconds < 60 => bail!("resync_interval must be at least 60 seconds."),
+            seconds => Duration::from_secs(seconds.unwrap_or(3600)),
         };
 
         let data_dir = match file.data_dir {
@@ -173,27 +174,23 @@ impl Config {
 
         // Keys only: a NIP-05 address here would hand the list to whoever
         // controls the domain, and its lookup could fail at startup.
-        let authors = match file.authors {
-            None => None,
-            Some(authors) if authors.is_empty() => {
-                bail!("authors must list at least one npub, or be left out to serve anyone's repositories.")
-            }
-            Some(authors) => Some(
-                authors
-                    .iter()
-                    .map(|author| {
-                        let author = author.trim();
-                        match nip19::decode(author) {
-                            Ok(nip19::Decoded::Npub(pubkey)) => Ok(pubkey),
-                            _ if author.len() == 64 && author.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(author.to_ascii_lowercase()),
-                            _ => bail!("authors must be npubs or hex public keys, and {author:?} is neither."),
-                        }
-                    })
-                    .collect::<Result<HashSet<_>>>()?,
-            ),
-        };
+        let authors = file.authors.unwrap_or_default();
+        if authors.is_empty() {
+            bail!("authors must list the npubs whose applications the gateway serves, eg authors = [\"npub1...\"].");
+        }
+        let authors = authors
+            .iter()
+            .map(|author| {
+                let author = author.trim();
+                match nip19::decode(author) {
+                    Ok(nip19::Decoded::Npub(pubkey)) => Ok(pubkey),
+                    _ if author.len() == 64 && author.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(author.to_ascii_lowercase()),
+                    _ => bail!("authors must be npubs or hex public keys, and {author:?} is neither."),
+                }
+            })
+            .collect::<Result<HashSet<_>>>()?;
 
-        Ok(Self { source, bind, public_url, data_dir, relays, blossom_servers, ttl, log, authors })
+        Ok(Self { source, bind, public_url, data_dir, relays, blossom_servers, resync_interval, log, authors })
     }
 
     /// Path of the SQLite database file.
@@ -210,7 +207,7 @@ impl Config {
 fn not_found(env: &Environment) -> anyhow::Error {
     let tried: Vec<String> = env.config_candidates().iter().map(|path| path.display().to_string()).collect();
     anyhow!(
-        "No config file at {}. Write one with public_url set (npkg-gateway.example.toml lists every setting), or name one with --config.",
+        "No config file at {}. Write one with public_url and authors set (npkg-gateway.example.toml lists every setting), or name one with --config.",
         tried.join(" or ")
     )
 }
@@ -239,8 +236,13 @@ mod tests {
         Environment { root: false, home: Some("/home/someone".into()), ..Default::default() }
     }
 
+    const NPUB: &str = "npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj";
+    const HEX: &str = "781a1527055f74c1f70230f10384609b34548f8ab6a0a6caa74025827f9fdae5";
+
+    /// `text`, with an author added unless it names some.
     fn config(text: &str) -> Result<Config> {
-        let file: File = toml::from_str(text)?;
+        let text = if text.contains("authors") { text.to_string() } else { format!("authors = [\"{NPUB}\"]\n{text}") };
+        let file: File = toml::from_str(&text)?;
         Config::from_file(file, SYSTEM_PATH.into(), &env())
     }
 
@@ -252,18 +254,17 @@ mod tests {
         assert_eq!(c.data_dir, Path::new("/home/someone/.local/share/npkg-gateway"));
         assert_eq!(c.relays, DEFAULT_RELAYS);
         assert_eq!(c.blossom_servers, DEFAULT_BLOSSOM_SERVERS);
-        assert_eq!(c.ttl, Duration::from_secs(300));
+        assert_eq!(c.resync_interval, Duration::from_secs(3600));
         assert_eq!(c.log, "info");
-        assert_eq!(c.authors, None);
     }
 
     #[test]
     fn authors_are_npubs_or_hex() {
-        let hex = "781a1527055f74c1f70230f10384609b34548f8ab6a0a6caa74025827f9fdae5";
-        let npub = "npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj";
-        let c = config(&format!("public_url = \"http://x\"\nauthors = [\"{npub}\", \"{}\"]", hex.to_uppercase())).unwrap();
-        assert_eq!(c.authors, Some(HashSet::from([hex.to_string()])));
+        let c = config(&format!("public_url = \"http://x\"\nauthors = [\"{NPUB}\", \"{}\"]", HEX.to_uppercase())).unwrap();
+        assert_eq!(c.authors, HashSet::from([HEX.to_string()]));
         assert!(config("public_url = \"http://x\"\nauthors = []").is_err());
+        let file: File = toml::from_str("public_url = \"http://x\"").unwrap();
+        assert!(Config::from_file(file, SYSTEM_PATH.into(), &env()).is_err());
         assert!(config("public_url = \"http://x\"\nauthors = [\"soapbox.pub\"]").is_err());
         assert!(config("public_url = \"http://x\"\nauthors = [\"npub1\"]").is_err());
     }
@@ -274,7 +275,7 @@ mod tests {
         assert_eq!(c.data_dir, Path::new("/etc/npkg-gateway/data"));
         assert_eq!(c.database_path(), Path::new("/etc/npkg-gateway/data/npkg-gateway.sqlite"));
         let root = Environment { root: true, ..env() };
-        let file: File = toml::from_str("public_url = \"http://x\"").unwrap();
+        let file: File = toml::from_str(&format!("public_url = \"http://x\"\nauthors = [\"{NPUB}\"]")).unwrap();
         assert_eq!(Config::from_file(file, "/x/npkg-gateway.toml".into(), &root).unwrap().data_dir, Path::new(SYSTEM_DATA_DIR));
     }
 
@@ -288,8 +289,9 @@ mod tests {
         assert!(config("public_url = \"http://x\"\nrelays = []").is_err());
         assert!(config("public_url = \"http://x\"\nrelays = [\"relay.ditto.pub\"]").is_err());
         assert!(config("public_url = \"http://x\"\nblossom_servers = [\"blossom.ditto.pub\"]").is_err());
-        assert!(config("public_url = \"http://x\"\nttl = 0").is_err());
-        assert!(config("public_url = \"http://x\"\nttl = \"300\"").is_err());
+        assert!(config("public_url = \"http://x\"\nresync_interval = 10").is_err());
+        assert!(config("public_url = \"http://x\"\nresync_interval = \"3600\"").is_err());
+        assert!(config("public_url = \"http://x\"\nttl = 300").is_err());
         // Unknown keys, and the old flags' names.
         assert!(config("public_url = \"http://x\"\nblossom = []").is_err());
         assert!(config("public_url = \"http://x\"\nlisten = \"127.0.0.1:8080\"").is_err());
@@ -313,7 +315,11 @@ mod tests {
         assert_eq!(env.config_candidates(), [dir.path().join("npkg-gateway/npkg-gateway.toml"), PathBuf::from(SYSTEM_PATH)]);
 
         std::fs::create_dir(dir.path().join("npkg-gateway")).unwrap();
-        std::fs::write(dir.path().join("npkg-gateway/npkg-gateway.toml"), "public_url = \"http://mine\"\ndata_dir = \"d\"").unwrap();
+        std::fs::write(
+            dir.path().join("npkg-gateway/npkg-gateway.toml"),
+            format!("public_url = \"http://mine\"\ndata_dir = \"d\"\nauthors = [\"{NPUB}\"]"),
+        )
+        .unwrap();
         let c = Config::load(None, &env).unwrap();
         assert_eq!(c.public_url, "http://mine");
         assert_eq!(c.data_dir, dir.path().join("npkg-gateway/d"));

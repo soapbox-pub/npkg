@@ -1,8 +1,9 @@
 //! npkg-gateway: apt and dnf repositories for software released on Nostr.
 //!
-//! Each NIP-82 application gets its own repository at `/apt/<owner>/<d>` and
-//! `/rpm/<owner>/<d>`, where the owner is its author's npub or NIP-05
-//! address, built from the author's events and signed with the gateway's key.
+//! Each NIP-82 application the team publishes gets its own repository at
+//! `/apt/<owner>/<d>` and `/rpm/<owner>/<d>`, where the owner is its author's
+//! npub or NIP-05 address, kept current from the author's events as they're
+//! published and signed with the gateway's key.
 
 mod apt;
 mod config;
@@ -11,10 +12,13 @@ mod http;
 mod inspect;
 mod nip82;
 mod nostr;
+mod rate_limit;
 mod repo;
 mod rpmmd;
 mod signing;
+mod sync;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -68,12 +72,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => {
             let signer = Arc::new(signing::Signer::load(&key_path)?);
             let db = db::Db::open(&config.database_path())?;
-            let names = nostr::nip05::Resolver::new(config.ttl, db.clone())?;
-            let repos = repo::Repos::new(
-                repo::Config { relays: config.relays.clone(), blossom: config.blossom_servers.clone(), ttl: config.ttl },
+            let names = nostr::nip05::Resolver::new(db.clone(), config.authors.clone())?;
+            let repos = repo::Repos::new(config.blossom_servers.clone(), db.clone(), signer)?;
+            sync::Worker {
+                relays: config.relays.clone(),
+                authors: config.authors.clone(),
+                resync_interval: config.resync_interval,
                 db,
-                signer,
-            )?;
+                repos: repos.clone(),
+            }
+            .start();
             let public_url = config.public_url.clone();
             let app =
                 http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone(), authors: config.authors.clone() }));
@@ -81,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             let bind = config.bind;
             let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("Couldn't listen on {bind}."))?;
             tracing::info!(%bind, public_url, config = %config.source.display(), "listening");
-            axum::serve(listener, app)
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })

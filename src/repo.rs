@@ -7,11 +7,9 @@
 //! a package is, is what the file says. Adding a repository trusts its author
 //! as much as adding any third-party repository does.
 //!
-//! A repository is built the first time it's asked for, and that request
-//! waits. After that it's served from memory, and rebuilt in the background
-//! once it's older than the TTL, so no later request waits on relays. What
-//! relays said is stored, so after a restart a repository is rebuilt from
-//! that, without the network, and refreshed in the background as before.
+//! Repositories are built by the sync worker (`sync.rs`) as their events
+//! arrive, and served from memory: no request ever waits on relays or on
+//! downloads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,16 +45,6 @@ const DOWNLOADS: usize = 4;
 
 /// The most package files one repository considers.
 const MAX_CANDIDATES: usize = 500;
-
-/// How long a failed build is remembered before the next request tries again.
-const FAILURE_TTL: Duration = Duration::from_secs(30);
-
-pub struct Config {
-    pub relays: Vec<String>,
-    /// Blossom servers to look for a package file on, after its own URL.
-    pub blossom: Vec<String>,
-    pub ttl: Duration,
-}
 
 /// A channel's rank in [`CHANNELS`].
 pub fn channel_rank(name: &str) -> Option<usize> {
@@ -112,6 +100,11 @@ pub struct Repo {
     apt: HashMap<String, HashMap<String, Vec<u8>>>,
     /// By channel, then by path below it.
     rpm: HashMap<usize, HashMap<String, Vec<u8>>>,
+    /// What it was built from.
+    pub snapshot: nip82::Snapshot,
+    /// Whether a file was left out for a reason that might not hold next
+    /// time, such as a server being down.
+    pub incomplete: bool,
 }
 
 impl Repo {
@@ -151,44 +144,35 @@ fn sort_releases(releases: &mut [Release]) {
     releases.sort_by(|a, b| nip82::compare_versions(&b.version, &a.version).then_with(|| b.created_at.cmp(&a.created_at)));
 }
 
-#[derive(Clone, Debug)]
-pub enum BuildError {
-    NotFound(String),
-    Failed(String),
-}
-
-type BuildResult = Result<Arc<Repo>, BuildError>;
-
-struct Built {
-    /// When the next request rebuilds it.
-    refresh_at: Instant,
-    result: BuildResult,
-}
-
-#[derive(Default)]
-struct Slot {
-    state: tokio::sync::Mutex<Option<Built>>,
-    refreshing: AtomicBool,
+/// What the gateway has for a repository someone asks for.
+pub enum Lookup {
+    Found(Arc<Repo>),
+    /// Not built, and the first sync since startup hasn't finished: it may
+    /// yet turn up.
+    Syncing,
+    Missing,
 }
 
 pub struct Repos {
-    config: Config,
+    /// Blossom servers to look for a package file on, after its own URL.
+    blossom: Vec<String>,
     db: Db,
     http: reqwest::Client,
     signer: Arc<Signer>,
-    /// Never held across an await.
-    slots: std::sync::Mutex<HashMap<(String, String), Arc<Slot>>>,
+    /// By author and `d`. Never held across an await.
+    built: std::sync::RwLock<HashMap<(String, String), Arc<Repo>>>,
+    synced: AtomicBool,
 }
 
 impl Repos {
-    pub fn new(config: Config, db: Db, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
+    pub fn new(blossom: Vec<String>, db: Db, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
-        Ok(Arc::new(Repos { config, db, http, signer, slots: Default::default() }))
+        Ok(Arc::new(Repos { blossom, db, http, signer, built: Default::default(), synced: AtomicBool::new(false) }))
     }
 
     pub fn signer(&self) -> &Signer {
@@ -196,81 +180,43 @@ impl Repos {
     }
 
     /// The repository for `pubkey`'s application `d`.
-    pub async fn get(self: &Arc<Self>, pubkey: &str, d: &str) -> BuildResult {
-        let key = (pubkey.to_string(), d.to_string());
-        let slot = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(key.clone()).or_default().clone();
-
-        let mut state = slot.state.lock().await;
-        if state.is_none() {
-            *state = self.stored(pubkey, d).await;
-        }
-        if let Some(built) = &*state {
-            if Instant::now() < built.refresh_at {
-                return built.result.clone();
-            }
-            if built.result.is_ok() {
-                if !slot.refreshing.swap(true, Ordering::AcqRel) {
-                    let (repos, slot) = (self.clone(), slot.clone());
-                    tokio::spawn(async move {
-                        let result = repos.build(&key.0, &key.1).await;
-                        let mut state = slot.state.lock().await;
-                        match result {
-                            Ok(repo) => *state = Some(Built { refresh_at: Instant::now() + repos.config.ttl, result: Ok(repo) }),
-                            // What was built last stays up while relays or
-                            // servers are failing.
-                            Err(error) => tracing::warn!(pubkey = key.0, d = key.1, ?error, "rebuild failed"),
-                        }
-                        slot.refreshing.store(false, Ordering::Release);
-                    });
-                }
-                return built.result.clone();
-            }
-        }
-
-        let result = self.build(pubkey, d).await;
-        let ttl = if result.is_ok() { self.config.ttl } else { FAILURE_TTL };
-        *state = Some(Built { refresh_at: Instant::now() + ttl, result: result.clone() });
-        result
-    }
-
-    /// The repository as relays last described it, before this process
-    /// started, built without the network. It's as old as that answer is.
-    async fn stored(&self, pubkey: &str, d: &str) -> Option<Built> {
-        let (snapshot, age) = match self.db.snapshot(pubkey, d).await {
-            Ok(row) => row?,
-            Err(error) => {
-                tracing::warn!(pubkey, d, ?error, "couldn't read a stored snapshot");
-                return None;
-            }
-        };
-        match self.assemble(pubkey, d, &snapshot, true).await {
-            Ok(repo) => Some(Built { refresh_at: Instant::now() + self.config.ttl.saturating_sub(age), result: Ok(repo) }),
-            Err(error) => {
-                tracing::warn!(pubkey, d, ?error, "couldn't build from a stored snapshot");
-                None
-            }
+    pub fn get(&self, pubkey: &str, d: &str) -> Lookup {
+        let built = self.built.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match built.get(&(pubkey.to_string(), d.to_string())) {
+            Some(repo) => Lookup::Found(repo.clone()),
+            None if !self.synced.load(Ordering::Acquire) => Lookup::Syncing,
+            None => Lookup::Missing,
         }
     }
 
-    /// Ask relays, build, and store what they said once it builds.
-    async fn build(&self, pubkey: &str, d: &str) -> BuildResult {
-        let snapshot = nip82::fetch(&self.config.relays, pubkey, d).await.map_err(|error| BuildError::Failed(format!("{error:#}")))?;
-        if snapshot.application.is_none() && snapshot.releases.is_empty() {
-            return Err(BuildError::NotFound(format!(
-                "No NIP-82 application {d:?} by {} was found on the gateway's relays.",
-                nip19::npub_encode(pubkey)
-            )));
-        }
-        let repo = self.assemble(pubkey, d, &snapshot, false).await?;
-        if let Err(error) = self.db.store_snapshot(pubkey, d, &snapshot).await {
-            tracing::warn!(pubkey, d, ?error, "couldn't store a snapshot");
-        }
-        Ok(repo)
+    /// Every repository, by author and then `d`.
+    pub fn all(&self) -> Vec<Arc<Repo>> {
+        let mut all: Vec<Arc<Repo>> = self.built.read().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned().collect();
+        all.sort_by(|a, b| (&a.pubkey, &a.d).cmp(&(&b.pubkey, &b.d)));
+        all
+    }
+
+    /// Serve `repo` in place of whatever was served for its application.
+    pub fn publish(&self, repo: Repo) {
+        let key = (repo.pubkey.clone(), repo.d.clone());
+        self.built.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key, Arc::new(repo));
+    }
+
+    /// Stop serving every repository `keep` says no to.
+    pub fn retain(&self, keep: impl Fn(&str, &str) -> bool) {
+        self.built.write().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|(pubkey, d), _| keep(pubkey, d));
+    }
+
+    /// From now on, a repository that isn't built doesn't exist.
+    pub fn mark_synced(&self) {
+        self.synced.store(true, Ordering::Release);
     }
 
     /// The repository `snapshot` describes. `offline`, a package file not
-    /// inspected before is left out rather than downloaded.
-    async fn assemble(&self, pubkey: &str, d: &str, snapshot: &nip82::Snapshot, offline: bool) -> BuildResult {
+    /// inspected before is left out rather than downloaded. An error is the
+    /// gateway's own, such as its database failing: what's wrong with the
+    /// author's files is in the repository's rejections.
+    pub async fn build(&self, pubkey: &str, d: &str, snapshot: &nip82::Snapshot, offline: bool) -> anyhow::Result<Repo> {
         let started = Instant::now();
         let mut rejections = Vec::new();
         let mut wanted = Vec::new();
@@ -293,17 +239,18 @@ impl Repos {
                     wanted.push((release.clone(), channel, asset.clone(), format));
                 }
             }
-            let assets =
-                release
-                    .assets
-                    .iter()
-                    .map(|asset| Asset {
-                        url: asset.url.clone().filter(|url| url.starts_with("https://")).or_else(|| {
-                            self.config.blossom.first().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256))
-                        }),
-                        ..asset.clone()
-                    })
-                    .collect();
+            let assets = release
+                .assets
+                .iter()
+                .map(|asset| Asset {
+                    url: asset
+                        .url
+                        .clone()
+                        .filter(|url| url.starts_with("https://"))
+                        .or_else(|| self.blossom.first().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256))),
+                    ..asset.clone()
+                })
+                .collect();
             releases.push(Release {
                 version: release.version.clone(),
                 channel,
@@ -325,6 +272,7 @@ impl Repos {
             .await;
 
         let mut candidates = Vec::new();
+        let mut incomplete = false;
         for (release, channel, asset, result) in inspected {
             let reject = |reason: String| Rejection { release: release.version.clone(), sha256: asset.sha256.clone(), reason };
             match result.map(|inspected| (inspected.meta, inspected.size, inspected.url)) {
@@ -338,7 +286,10 @@ impl Repos {
                     meta,
                 }),
                 Ok((Err(error), _, _)) => rejections.push(reject(error)),
-                Err(error) => rejections.push(reject(format!("{error:#}"))),
+                Err(error) => {
+                    incomplete = true;
+                    rejections.push(reject(format!("{error:#}")));
+                }
             }
         }
 
@@ -352,8 +303,7 @@ impl Repos {
         for candidate in candidates {
             let format = candidate.meta.format();
             let key = package_key(&candidate.meta);
-            let pinned =
-                self.db.pin(pubkey, d, format, &key, &candidate.sha256).await.map_err(|error| BuildError::Failed(format!("{error:#}")))?;
+            let pinned = self.db.pin(pubkey, d, format, &key, &candidate.sha256).await?;
             if pinned == candidate.sha256 {
                 packages.push(candidate);
                 continue;
@@ -390,7 +340,7 @@ impl Repos {
         let summary = snapshot.application.as_ref().and_then(|app| app.summary.clone());
         let signer = self.signer.clone();
         let description = format!("{name}, published on Nostr by {}", nip19::npub_encode(pubkey));
-        let (pubkey, d) = (pubkey.to_string(), d.to_string());
+        let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<Repo> {
             let mut apt = HashMap::new();
             let mut rpm = HashMap::new();
@@ -399,11 +349,9 @@ impl Repos {
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
             }
-            Ok(Repo { pubkey, d, name, summary, packages, rejections, releases, apt, rpm })
+            Ok(Repo { pubkey, d, name, summary, packages, rejections, releases, apt, rpm, snapshot, incomplete })
         })
-        .await
-        .map_err(|error| BuildError::Failed(error.to_string()))?
-        .map_err(|error| BuildError::Failed(format!("{error:#}")))?;
+        .await??;
 
         tracing::info!(
             pubkey = repo.pubkey,
@@ -414,7 +362,7 @@ impl Repos {
             offline,
             "built"
         );
-        Ok(Arc::new(repo))
+        Ok(repo)
     }
 
     /// What the package file `asset` names is, from the database, or by
@@ -429,7 +377,7 @@ impl Repos {
         anyhow::ensure!(!offline, "The file isn't downloaded yet. It will be tried again when the repository is next refreshed.");
 
         let mut urls: Vec<String> = asset.url.iter().filter(|url| url.starts_with("https://")).cloned().collect();
-        urls.extend(self.config.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
+        urls.extend(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
 
         let mut last_error = anyhow::anyhow!("The asset has no https URL, and no Blossom server is configured.");
         for url in urls {
@@ -624,73 +572,68 @@ mod tests {
         assert_eq!(db.pin("pk", "other", Format::Deb, "x 1 amd64", &second).await.unwrap(), second);
     }
 
-    /// A database as a gateway that built `hello` once leaves it: the
-    /// fixture .deb inspected, and the relays' answer stored.
-    async fn stored_hello(db: &Db) {
+    /// The fixture .deb, inspected into `db`, and a snapshot of one release
+    /// listing it and a file never seen before.
+    async fn hello(db: &Db) -> nip82::Snapshot {
         let bytes = include_bytes!("../tests/fixtures/hello_1.2.0-rc.1_amd64.deb");
         let sha256 = hex::encode(Sha256::digest(bytes));
         let url = "https://example.com/hello.deb".to_string();
         let meta = inspect::inspect(Format::Deb, bytes).unwrap();
         db.store_inspected(&sha256, &Inspected { size: bytes.len() as u64, url: url.clone(), meta: Ok(meta) }).await.unwrap();
-        let asset = Asset {
+        let asset = |sha256: String| Asset {
             mime: nip82::DEB_MIME.into(),
             sha256,
-            url: Some(url),
-            filename: Some("hello.deb".into()),
+            url: Some(url.clone()),
+            filename: None,
             size: Some(bytes.len() as u64),
             platforms: vec!["linux-x86_64".into()],
         };
-        let snapshot = nip82::Snapshot {
+        nip82::Snapshot {
             application: Some(nip82::Application { name: Some("Hello".into()), summary: None }),
             releases: vec![nip82::Release {
                 version: "1.2.0-rc.1".into(),
                 channel: "main".into(),
                 created_at: 1_700_000_000,
                 notes: String::new(),
-                assets: vec![asset],
+                assets: vec![asset(sha256), asset("c".repeat(64))],
             }],
-        };
-        db.store_snapshot("pk", "hello", &snapshot).await.unwrap();
+        }
     }
 
-    /// Repositories whose relays never answer.
-    fn offline_repos(dir: &std::path::Path, db: &Db, ttl: Duration) -> Arc<Repos> {
-        let key = dir.join(format!("key-{}.asc", ttl.as_secs()));
+    pub fn repos(dir: &std::path::Path, db: &Db) -> Arc<Repos> {
+        let key = dir.join(format!("key-{}.asc", rand::random::<u32>()));
         let signer = Arc::new(Signer::generate(&key, "test").unwrap());
-        Repos::new(Config { relays: vec!["ws://127.0.0.1:9".into()], blossom: Vec::new(), ttl }, db.clone(), signer).unwrap()
+        Repos::new(Vec::new(), db.clone(), signer).unwrap()
     }
 
     #[tokio::test]
-    async fn builds_from_a_stored_snapshot_without_relays() {
+    async fn builds_offline_from_what_was_inspected() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
-        stored_hello(&db).await;
+        let snapshot = hello(&db).await;
 
-        let repo = offline_repos(dir.path(), &db, Duration::from_secs(300)).get("pk", "hello").await.unwrap();
+        let repo = repos(dir.path(), &db).build("pk", "hello", &snapshot, true).await.unwrap();
         assert_eq!(repo.name, "Hello");
         assert_eq!(repo.packages.len(), 1);
-        assert!(repo.rejections.is_empty(), "{:?}", repo.rejections);
         let packages = repo.apt_file("stable", "main/binary-amd64/Packages").unwrap();
         assert!(std::str::from_utf8(packages).unwrap().contains("Package: hello"));
+        // The file never inspected isn't downloaded, and is tried again later.
+        assert_eq!(repo.rejections.len(), 1);
+        assert_eq!(repo.rejections[0].sha256, "c".repeat(64));
+        assert!(repo.incomplete);
 
         // Another process, from the same database, serves the same index.
-        let again = offline_repos(dir.path(), &db, Duration::from_secs(301)).get("pk", "hello").await.unwrap();
+        let again = repos(dir.path(), &db).build("pk", "hello", &snapshot, true).await.unwrap();
         assert_eq!(again.apt_file("stable", "Release"), repo.apt_file("stable", "Release"));
     }
 
-    #[tokio::test]
-    async fn keeps_a_stale_stored_repository_while_relays_fail() {
+    #[test]
+    fn says_whether_an_unbuilt_repository_may_turn_up() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
-        stored_hello(&db).await;
-        let repos = offline_repos(dir.path(), &db, Duration::ZERO);
-
-        assert_eq!(repos.get("pk", "hello").await.unwrap().packages.len(), 1);
-        let slot = repos.slots.lock().unwrap()[&("pk".to_string(), "hello".to_string())].clone();
-        while slot.refreshing.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(repos.get("pk", "hello").await.unwrap().packages.len(), 1);
-        assert!(db.snapshot("pk", "hello").await.unwrap().is_some());
+        let repos = repos(dir.path(), &db);
+        assert!(matches!(repos.get("pk", "hello"), Lookup::Syncing));
+        repos.mark_synced();
+        assert!(matches!(repos.get("pk", "hello"), Lookup::Missing));
     }
 }

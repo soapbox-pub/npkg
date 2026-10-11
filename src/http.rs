@@ -11,10 +11,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -24,7 +26,7 @@ use serde_json::{Value, json};
 use crate::inspect::Format;
 use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
-use crate::repo::{BuildError, CHANNELS, Release, Repo, Repos, channel_rank};
+use crate::repo::{CHANNELS, Lookup, Release, Repo, Repos, channel_rank};
 use crate::{apt, nip82};
 
 pub struct AppState {
@@ -32,8 +34,8 @@ pub struct AppState {
     pub names: Arc<Resolver>,
     /// Where the gateway is reached, for the setup files: no trailing slash.
     pub public_url: String,
-    /// The hex pubkeys whose repositories are served, or `None` for anyone's.
-    pub authors: Option<HashSet<String>>,
+    /// The hex pubkeys whose repositories are served.
+    pub authors: HashSet<String>,
 }
 
 type Shared = State<Arc<AppState>>;
@@ -71,9 +73,30 @@ fn json(value: &Value) -> Response {
     text("application/json", serde_json::to_string_pretty(value).unwrap_or_default() + "\n")
 }
 
+/// The address of whoever made a request, for the limits on what a request
+/// can make the gateway do. The socket's peer, unless that's a reverse proxy
+/// on this machine: then the address the proxy added to `X-Forwarded-For`,
+/// last, since a client can write the ones before it.
+pub struct Client(IpAddr);
+
+impl<S: Send + Sync> FromRequestParts<S> for Client {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Client, Self::Rejection> {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map_or(IpAddr::from([0, 0, 0, 0]), |info| info.0.ip());
+        if !peer.is_loopback() {
+            return Ok(Client(peer));
+        }
+        let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
+        let forwarded = header("x-forwarded-for").and_then(|value| value.rsplit(',').next()).and_then(|ip| ip.trim().parse().ok());
+        let real = header("x-real-ip").and_then(|ip| ip.trim().parse().ok());
+        Ok(Client(forwarded.or(real).unwrap_or(peer)))
+    }
+}
+
 /// The hex pubkey an npub or a NIP-05 address names, and the owner as the
 /// URLs this gateway hands out give it.
-async fn owner(state: &AppState, value: &str) -> Result<(String, String), Response> {
+async fn owner(state: &AppState, client: IpAddr, value: &str) -> Result<(String, String), Response> {
     if let Ok(nip19::Decoded::Npub(pubkey)) = nip19::decode(value) {
         let npub = nip19::npub_encode(&pubkey);
         return Ok((pubkey, npub));
@@ -84,51 +107,72 @@ async fn owner(state: &AppState, value: &str) -> Result<(String, String), Respon
             format!("{value:?} isn't an npub or a NIP-05 address like alex@gleasonator.com or soapbox.pub."),
         ));
     };
-    match state.names.resolve(&address).await {
+    match state.names.resolve(&address, client).await {
         Ok(pubkey) => Ok((pubkey, value.to_ascii_lowercase())),
         Err(nip05::LookupError::NotFound(message)) => Err(error(StatusCode::NOT_FOUND, message)),
         Err(nip05::LookupError::Failed(message)) => Err(error(StatusCode::BAD_GATEWAY, message)),
+        Err(nip05::LookupError::Limited(message)) => Err(error(StatusCode::TOO_MANY_REQUESTS, message)),
     }
 }
 
-/// The repository at `owner`/`d`, built if it has to be, and its owner as
-/// [`owner`] gives it.
-async fn repo(state: &AppState, owner_value: &str, d: &str) -> Result<(Arc<Repo>, String), Response> {
-    // Anything NIP-82 allows, short of what would break a path or a file.
-    if d.is_empty() || d.len() > 256 || d.chars().any(|c| c.is_control() || c == '/') {
+/// The repository at `owner`/`d`, and its owner as [`owner`] gives it.
+async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> Result<(Arc<Repo>, String), Response> {
+    if !nip82::valid_d(d) {
         return Err(error(StatusCode::NOT_FOUND, format!("{d:?} isn't an application id this gateway can serve.")));
     }
-    let (pubkey, owner) = owner(state, owner_value).await?;
-    // Checked before building, so an author nobody listed costs no relay
-    // queries or downloads.
-    if state.authors.as_ref().is_some_and(|authors| !authors.contains(&pubkey)) {
+    let (pubkey, owner) = owner(state, client, owner_value).await?;
+    if !state.authors.contains(&pubkey) {
         return Err(error(
-            StatusCode::FORBIDDEN,
-            format!("This gateway only serves repositories for the authors its operator lists, and {owner} isn't one of them."),
+            StatusCode::NOT_FOUND,
+            format!(
+                "This gateway only serves its team's repositories, and {owner} isn't on the team. They're listed at {}/.",
+                state.public_url
+            ),
         ));
     }
-    let repo = state.repos.get(&pubkey, d).await.map_err(|failure| match failure {
-        BuildError::NotFound(message) => error(StatusCode::NOT_FOUND, message),
-        BuildError::Failed(message) => error(StatusCode::BAD_GATEWAY, message),
-    })?;
-    Ok((repo, owner))
+    match state.repos.get(&pubkey, d) {
+        Lookup::Found(repo) => Ok((repo, owner)),
+        Lookup::Syncing => {
+            let mut response = error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The gateway has just started and is still syncing with relays. Try again in a minute.",
+            );
+            response.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static("30"));
+            Err(response)
+        }
+        Lookup::Missing => {
+            Err(error(StatusCode::NOT_FOUND, format!("{owner} has published no NIP-82 application {d:?} that the gateway has seen.")))
+        }
+    }
 }
 
 async fn index(State(state): Shared) -> Response {
-    text(
-        "text/plain; charset=utf-8",
-        format!(
-            "npkg-gateway: apt and dnf repositories for software released on Nostr (NIP-82).\n\n\
-             apt:  {0}/apt/<owner>/<app-id>\n\
-             dnf:  {0}/rpm/<owner>/<app-id>\n\
-             releases, as JSON:  {0}/releases/<owner>/<app-id>, and /latest\n\
-             a release's file:   {0}/releases/<owner>/<app-id>/latest/download/<filename>\n\
-             The owner is an npub, or a NIP-05 address: alex@gleasonator.com, or soapbox.pub for _@soapbox.pub.\n\n\
-             key:  {0}/key.asc ({1})\n",
-            state.public_url,
-            state.repos.signer().fingerprint()
-        ),
-    )
+    let base = &state.public_url;
+    let mut out = format!(
+        "npkg-gateway: apt and dnf repositories for software its team releases on Nostr (NIP-82).\n\n\
+         apt:  {base}/apt/<owner>/<app-id>\n\
+         dnf:  {base}/rpm/<owner>/<app-id>\n\
+         releases, as JSON:  {base}/releases/<owner>/<app-id>, and /latest\n\
+         a release's file:   {base}/releases/<owner>/<app-id>/latest/download/<filename>\n\
+         The owner is an npub, or a NIP-05 address: alex@gleasonator.com, or soapbox.pub for _@soapbox.pub.\n\n\
+         key:  {base}/key.asc ({})\n\nRepositories:\n",
+        state.repos.signer().fingerprint()
+    );
+    let repos = state.repos.all();
+    if repos.is_empty() {
+        let _ = writeln!(out, "  none yet");
+    }
+    for repo in repos {
+        let _ = writeln!(
+            out,
+            "  {} ({}): {base}/apt/{}/{}",
+            repo.name.replace('\n', " "),
+            repo.d,
+            nip19::npub_encode(&repo.pubkey),
+            segment(&repo.d)
+        );
+    }
+    text("text/plain; charset=utf-8", out)
 }
 
 async fn key(State(state): Shared) -> Response {
@@ -136,8 +180,8 @@ async fn key(State(state): Shared) -> Response {
 }
 
 /// What a repository holds, what it left out and why, and how to add it.
-async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) -> Response {
-    let (repo, owner) = match repo(&state, &owner, &d).await {
+async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): Path<(String, String)>) -> Response {
+    let (repo, owner) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -237,10 +281,11 @@ fn setup_channel(query: &HashMap<String, String>) -> Result<&str, Response> {
 /// repository is one download.
 async fn apt_source(
     State(state): Shared,
+    Client(client): Client,
     Path((owner, d)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let (repo, owner) = match repo(&state, &owner, &d).await {
+    let (repo, owner) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -267,8 +312,12 @@ async fn apt_source(
     )
 }
 
-async fn apt_dists(State(state): Shared, Path((owner, d, suite, path)): Path<(String, String, String, String)>) -> Response {
-    let (repo, _) = match repo(&state, &owner, &d).await {
+async fn apt_dists(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, suite, path)): Path<(String, String, String, String)>,
+) -> Response {
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -279,18 +328,23 @@ async fn apt_dists(State(state): Shared, Path((owner, d, suite, path)): Path<(St
     text(content_type, body.to_vec())
 }
 
-async fn apt_pool(State(state): Shared, Path((owner, d, sha256, _file)): Path<(String, String, String, String)>) -> Response {
-    download(&state, &owner, &d, Format::Deb, &sha256).await
+async fn apt_pool(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, sha256, _file)): Path<(String, String, String, String)>,
+) -> Response {
+    download(&state, client, &owner, &d, Format::Deb, &sha256).await
 }
 
 /// A `.repo` file for `/etc/yum.repos.d/`. Packages themselves aren't
 /// signed by anyone dnf knows; the repodata that names their hashes is.
 async fn rpm_repo(
     State(state): Shared,
+    Client(client): Client,
     Path((owner, d)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let (repo, owner) = match repo(&state, &owner, &d).await {
+    let (repo, owner) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -312,11 +366,15 @@ async fn rpm_repo(
     )
 }
 
-async fn rpm_repodata(State(state): Shared, Path((owner, d, channel, file)): Path<(String, String, String, String)>) -> Response {
+async fn rpm_repodata(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, channel, file)): Path<(String, String, String, String)>,
+) -> Response {
     let Some(rank) = channel_rank(&channel) else {
         return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
     };
-    let (repo, _) = match repo(&state, &owner, &d).await {
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -333,19 +391,20 @@ async fn rpm_repodata(State(state): Shared, Path((owner, d, channel, file)): Pat
 
 async fn rpm_package(
     State(state): Shared,
+    Client(client): Client,
     Path((owner, d, channel, sha256, _file)): Path<(String, String, String, String, String)>,
 ) -> Response {
     if channel_rank(&channel).is_none() {
         return error(StatusCode::NOT_FOUND, format!("There's no channel {channel:?}."));
     }
-    download(&state, &owner, &d, Format::Rpm, &sha256).await
+    download(&state, client, &owner, &d, Format::Rpm, &sha256).await
 }
 
 /// A redirect to the package file on Blossom. apt and dnf check the file
 /// against the hash in the signed index, so where it's served from needn't
 /// be trusted.
-async fn download(state: &AppState, owner: &str, d: &str, format: Format, sha256: &str) -> Response {
-    let (repo, _) = match repo(state, owner, d).await {
+async fn download(state: &AppState, client: IpAddr, owner: &str, d: &str, format: Format, sha256: &str) -> Response {
+    let (repo, _) = match repo(state, client, owner, d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -387,8 +446,8 @@ fn release_json(base: &str, release: &Release) -> Value {
 }
 
 /// Every release, highest version first.
-async fn releases(State(state): Shared, Path((owner, d)): Path<(String, String)>) -> Response {
-    let (repo, owner) = match repo(&state, &owner, &d).await {
+async fn releases(State(state): Shared, Client(client): Client, Path((owner, d)): Path<(String, String)>) -> Response {
+    let (repo, owner) = match repo(&state, client, &owner, &d).await {
         Ok(found) => found,
         Err(response) => return response,
     };
@@ -399,10 +458,11 @@ async fn releases(State(state): Shared, Path((owner, d)): Path<(String, String)>
 /// The latest release on `?channel=`, or the stable one.
 async fn latest_release(
     State(state): Shared,
+    Client(client): Client,
     Path((owner, d)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match latest(&state, &owner, &d, &query).await {
+    match latest(&state, client, &owner, &d, &query).await {
         Ok((repo, owner, release)) => json(&release_json(&releases_url(&state, &owner, &repo), &release)),
         Err(response) => response,
     }
@@ -410,33 +470,48 @@ async fn latest_release(
 
 async fn latest_download(
     State(state): Shared,
+    Client(client): Client,
     Path((owner, d, name)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match latest(&state, &owner, &d, &query).await {
+    match latest(&state, client, &owner, &d, &query).await {
         Ok((repo, owner, release)) => asset_redirect(&releases_url(&state, &owner, &repo), &release, &name),
         Err(response) => response,
     }
 }
 
-async fn tagged_release(State(state): Shared, Path((owner, d, version)): Path<(String, String, String)>) -> Response {
-    match tagged(&state, &owner, &d, &version).await {
+async fn tagged_release(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, version)): Path<(String, String, String)>,
+) -> Response {
+    match tagged(&state, client, &owner, &d, &version).await {
         Ok((repo, owner, release)) => json(&release_json(&releases_url(&state, &owner, &repo), &release)),
         Err(response) => response,
     }
 }
 
-async fn tagged_download(State(state): Shared, Path((owner, d, version, name)): Path<(String, String, String, String)>) -> Response {
-    match tagged(&state, &owner, &d, &version).await {
+async fn tagged_download(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d, version, name)): Path<(String, String, String, String)>,
+) -> Response {
+    match tagged(&state, client, &owner, &d, &version).await {
         Ok((repo, owner, release)) => asset_redirect(&releases_url(&state, &owner, &repo), &release, &name),
         Err(response) => response,
     }
 }
 
 /// The repository, its owner, and its latest release on `?channel=`.
-async fn latest(state: &AppState, owner: &str, d: &str, query: &HashMap<String, String>) -> Result<(Arc<Repo>, String, Release), Response> {
+async fn latest(
+    state: &AppState,
+    client: IpAddr,
+    owner: &str,
+    d: &str,
+    query: &HashMap<String, String>,
+) -> Result<(Arc<Repo>, String, Release), Response> {
     let channel = setup_channel(query)?;
-    let (repo, owner) = repo(state, owner, d).await?;
+    let (repo, owner) = repo(state, client, owner, d).await?;
     let rank = channel_rank(channel).unwrap_or(0);
     let Some(release) = repo.latest(rank) else {
         let wider = if rank + 1 < CHANNELS.len() {
@@ -451,8 +526,8 @@ async fn latest(state: &AppState, owner: &str, d: &str, query: &HashMap<String, 
 }
 
 /// The repository, its owner, and its release `version`.
-async fn tagged(state: &AppState, owner: &str, d: &str, version: &str) -> Result<(Arc<Repo>, String, Release), Response> {
-    let (repo, owner) = repo(state, owner, d).await?;
+async fn tagged(state: &AppState, client: IpAddr, owner: &str, d: &str, version: &str) -> Result<(Arc<Repo>, String, Release), Response> {
+    let (repo, owner) = repo(state, client, owner, d).await?;
     let Some(release) = repo.release(version).cloned() else {
         return Err(error(
             StatusCode::NOT_FOUND,

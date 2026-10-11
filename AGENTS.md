@@ -1,12 +1,14 @@
 # npkg-gateway
 
-apt and dnf repositories for software released on Nostr (NIP-82). Each
-application's repository, at `/apt/<owner>/<d>` and `/rpm/<owner>/<d>`, serves
-every package its releases list, under any name. The owner is an npub or a
-NIP-05 address (`alex@gleasonator.com`, or `soapbox.pub` for `_@soapbox.pub`).
-See README.md for what's left out.
+apt and dnf repositories for software a team releases on Nostr (NIP-82).
+The gateway follows the NIP-82 events of the authors its config lists, and
+each application they publish gets a repository, at `/apt/<owner>/<d>` and
+`/rpm/<owner>/<d>`, that serves every package its releases list, under any
+name. The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
+`soapbox.pub` for `_@soapbox.pub`). See README.md for what's left out.
 
-This is a spike: kept simple on purpose, and revised as we go.
+This is a spike: kept simple on purpose, and revised as we go. Nothing is
+deployed yet, so there's no backwards compatibility to keep.
 
 ## Layout
 
@@ -14,40 +16,52 @@ This is a spike: kept simple on purpose, and revised as we go.
 src/
   main.rs        the CLI: keygen, serve
   config.rs      the TOML config file (npkg-gateway.example.toml)
+  sync.rs        the sync worker: builds at startup from stored events,
+                 follows the team live, resyncs every resync_interval
   http.rs        the routes, setup files, the status page, and release JSON
-                 and downloads (/releases/<owner>/<d>)
-  repo.rs        building a repository: fetch, inspect, select, pin, render;
-                 cached in memory, rebuilt in the background, and rebuilt
-                 offline from the stored snapshot after a restart
-  nip82.rs       application, release and asset events, fetched from relays
+                 and downloads (/releases/<owner>/<d>); the client's address
+  repo.rs        building a repository: inspect, select, pin, render; the
+                 built ones, which requests read
+  nip82.rs       reading applications, releases and assets from events
   nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (stored,
-                 and refreshed in the background), one-shot relay queries
+                 refreshed daily, limited per client), relay queries and
+                 subscriptions
+  rate_limit.rs  token buckets, after npanel's
   inspect/       reading a .deb's control file and an .rpm's header
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
   signing.rs     the gateway's Ed25519 OpenPGP key
-  db.rs          SQLite: inspected package files, pins, NIP-05 keys,
-                 and relay snapshots
+  db.rs          SQLite: the team's events, inspected package files, pins,
+                 NIP-05 keys
 tests/fixtures/  tiny real packages nfpm built (see its README)
 ```
 
 ## How a build goes
 
-A request for a repository nobody has asked for yet waits while it's built.
-After that it's served from memory and rebuilt in the background once it's
-older than `ttl`; a failed rebuild keeps the last good one up.
+No request ever builds anything or waits on relays: the sync worker builds
+repositories and swaps them in, and requests read what's there. Until the
+first resync after startup finishes, a repository that isn't built yet is a
+503, since it may yet turn up; after that, a 404.
 
-What the relays said (step 1) is stored once it builds. After a restart, a
-repository is rebuilt from that without the network, in milliseconds, since
-everything steps 2 and 3 need is in SQLite too; then it's refreshed in the
-background like any other once it's older than `ttl`. Only a repository the
-gateway has never built makes a request wait on relays.
+- At startup, every repository is built from the stored events, without the
+  network, in milliseconds.
+- A live subscription stores each new event from the team and, once things
+  have been quiet for a few seconds, rebuilds its author's repositories.
+- Every `resync_interval`, everything is fetched from the relays again.
 
-1. Fetch the application, its releases, and their assets from the relays,
-   keeping only events signed by the application's author.
+A rebuild of an author goes through each of their applications, and only
+builds one whose snapshot (what its events say) changed, or, on a resync,
+one that couldn't download a file last time. A failed build leaves the last
+one up.
+
+1. Read the application, its releases, and their assets from the stored
+   events, which only ever hold events signed by a team member, and only the
+   newest of each address. Asset events a release lists but the database
+   lacks are fetched first.
 2. Download each .deb and .rpm asset not seen before, check its sha256, read
    its metadata, and store that in SQLite by hash. A file's hash never
-   changes, so this happens once per file.
+   changes, so this happens once per file. The file itself isn't kept:
+   downloads are redirects.
 3. Select the files an index can hold, each once, then pin: the first file
    for a package version (name, version, architecture, as the file says) is
    the one served from then on.
@@ -80,6 +94,7 @@ cat > npkg-gateway.toml <<'EOF'   # once; gitignored
 public_url = "http://127.0.0.1:8099"
 bind = "127.0.0.1:8099"
 data_dir = "data"
+authors = ["npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj"]
 EOF
 cargo run -- -c npkg-gateway.toml keygen   # once
 cargo run -- -c npkg-gateway.toml serve

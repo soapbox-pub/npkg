@@ -2,8 +2,8 @@
 # else the first of ~/.config/npkg-gateway/npkg-gateway.toml and
 # /etc/npkg-gateway/npkg-gateway.toml.
 #
-# Only public_url is required; the rest are shown with their defaults. A key
-# the gateway doesn't know is refused.
+# Only public_url and authors are required; the rest are shown with their
+# defaults. A key the gateway doesn't know is refused.
 
 # The URL users reach the gateway at, which the setup files point apt and dnf
 # to.
@@ -17,21 +17,22 @@ public_url = "https://pkg.example.com"
 # ~/.local/share/npkg-gateway.
 # data_dir = "/var/lib/npkg-gateway"
 
-# Relays to look for NIP-82 events on.
+# Relays to follow NIP-82 events on.
 # relays = ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"]
 
 # Blossom servers to look for package files on, when the URL an asset names
 # doesn't serve it.
 # blossom_servers = ["https://blossom.ditto.pub", "https://blossom.primal.net"]
 
-# How many seconds a repository, or a NIP-05 lookup, is served before it's
-# redone in the background.
-# ttl = 300
+# New events are picked up as they're published. Every this many seconds,
+# everything is fetched again as well, in case one was missed while a relay
+# was down, and files that couldn't be downloaded are tried again.
+# resync_interval = 3600
 
 # What to log, as tracing EnvFilter directives.
 # log = "info"
 
-# Serve only these authors' repositories, as npubs or hex public keys. Left
-# out, the gateway serves anyone's. A listed author's repositories can still
-# be reached by any NIP-05 address that names them.
-# authors = ["npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj"]
+# The team: whose NIP-82 applications the gateway follows and serves, as
+# npubs or hex public keys. Every application each one publishes gets a
+# repository. They can also be reached by any NIP-05 address that names them.
+authors = ["npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj"]

@@ -1,36 +1,29 @@
 //! NIP-82 software applications (kind 32267), releases (kind 30063) and
-//! assets (kind 3063): what one application's author has published, fetched
-//! from relays.
+//! assets (kind 3063): what an author has published, read from the events the
+//! gateway has stored.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-
-use crate::nostr::{Event, is_hex64, relay};
+use crate::nostr::{Event, is_hex64};
 
 pub const APPLICATION: i64 = 32267;
 pub const RELEASE: i64 = 30063;
 pub const ASSET: i64 = 3063;
 
+/// Every kind the gateway follows.
+pub const KINDS: [i64; 3] = [APPLICATION, RELEASE, ASSET];
+
 pub const DEB_MIME: &str = "application/vnd.debian.binary-package";
 pub const RPM_MIME: &str = "application/x-rpm";
 
-/// How long a build waits on relays, per round of queries.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// Asset ids asked for in one filter.
-const IDS_PER_FILTER: usize = 200;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Application {
     pub name: Option<String>,
     pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
     pub channel: String,
@@ -40,7 +33,7 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Asset {
     pub mime: String,
     pub sha256: String,
@@ -62,29 +55,60 @@ impl Asset {
     }
 }
 
-/// Everything one application's author has published about it. Stored, so
-/// a restart can rebuild a repository without asking relays.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Everything one application's author has published about it. Two are equal
+/// when a repository built from either would be the same.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub application: Option<Application>,
+    /// Oldest first.
     pub releases: Vec<Release>,
 }
 
-/// The application `pubkey:d`, its releases, and their assets. Only events
-/// signed by `pubkey` count: anyone can publish an event that points at
-/// someone else's application.
-pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<Snapshot> {
+/// Whether `d` can be an application's id here: anything NIP-82 allows, short
+/// of what would break a path or a file.
+pub fn valid_d(d: &str) -> bool {
+    !d.is_empty() && d.len() <= 256 && !d.chars().any(|c| c.is_control() || c == '/')
+}
+
+/// The `d` of every application `pubkey` has published, or published a
+/// release of.
+pub fn applications(events: &[Event], pubkey: &str) -> BTreeSet<String> {
+    let prefix = format!("{APPLICATION}:{pubkey}:");
+    let mut found = BTreeSet::new();
+    for event in events.iter().filter(|event| event.pubkey == pubkey) {
+        match event.kind {
+            APPLICATION => found.extend(event.tag("d").map(str::to_string)),
+            RELEASE => found.extend(
+                tag_values(event, "a").filter_map(|a| a.strip_prefix(&prefix)).filter(|d| event.tag("i") == Some(d)).map(str::to_string),
+            ),
+            _ => {}
+        }
+    }
+    found.retain(|d| valid_d(d));
+    found
+}
+
+/// The ids of the assets `pubkey`'s releases list that aren't in `events`.
+pub fn missing_assets(events: &[Event], pubkey: &str) -> Vec<String> {
+    let have: HashSet<&str> = events.iter().filter(|event| event.kind == ASSET).map(|event| event.id.as_str()).collect();
+    let mut missing: Vec<String> = events
+        .iter()
+        .filter(|event| event.kind == RELEASE && event.pubkey == pubkey)
+        .flat_map(|event| tag_values(event, "e"))
+        .filter(|id| is_hex64(id) && !have.contains(id))
+        .map(str::to_string)
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// The application `pubkey:d`, its releases, and their assets, as `events`
+/// have them. Only events signed by `pubkey` count: anyone can publish an
+/// event that points at someone else's application.
+pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
     let coordinate = format!("{APPLICATION}:{pubkey}:{d}");
-    let events = relay::query(
-        relays,
-        &[
-            json!({"kinds": [APPLICATION], "authors": [pubkey], "#d": [d]}),
-            json!({"kinds": [RELEASE], "authors": [pubkey], "#a": [coordinate]}),
-        ],
-        QUERY_TIMEOUT,
-    )
-    .await?;
-    let events: Vec<Event> = events.into_iter().filter(|event| event.pubkey == pubkey).collect();
+    let events: Vec<&Event> = events.iter().filter(|event| event.pubkey == pubkey).collect();
 
     let application = events
         .iter()
@@ -94,7 +118,7 @@ pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<S
 
     // Releases are addressable: of each `d`, the newest stands.
     let mut newest: HashMap<&str, &Event> = HashMap::new();
-    for event in events.iter().filter(|event| event.kind == RELEASE) {
+    for event in events.iter().copied().filter(|event| event.kind == RELEASE) {
         let Some(release_d) = event.tag("d") else { continue };
         if !has_tag(event, "a", &coordinate) || event.tag("i") != Some(d) {
             continue;
@@ -109,24 +133,12 @@ pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<S
         }
     }
 
-    let asset_ids: Vec<String> =
-        newest.values().flat_map(|event| tag_values(event, "e")).filter(|id| is_hex64(id)).map(str::to_string).collect();
-    let mut assets = HashMap::new();
-    for ids in asset_ids.chunks(IDS_PER_FILTER) {
-        let filter = json!({"ids": ids, "kinds": [ASSET], "authors": [pubkey]});
-        for event in relay::query(relays, &[filter], QUERY_TIMEOUT).await? {
-            // An asset's `i` is its own identifier on its platform, which
-            // NIP-82 lets differ from the application's: it isn't checked.
-            if event.kind != ASSET || event.pubkey != pubkey {
-                continue;
-            }
-            if let Some(asset) = parse_asset(&event) {
-                assets.insert(event.id.clone(), asset);
-            }
-        }
-    }
+    // An asset's `i` is its own identifier on its platform, which NIP-82
+    // lets differ from the application's: it isn't checked.
+    let assets: HashMap<&str, Asset> =
+        events.iter().filter(|event| event.kind == ASSET).filter_map(|event| Some((event.id.as_str(), parse_asset(event)?))).collect();
 
-    let releases = newest
+    let mut releases: Vec<Release> = newest
         .into_values()
         .map(|event| Release {
             version: event.tag("version").unwrap_or_default().to_string(),
@@ -136,8 +148,9 @@ pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<S
             assets: tag_values(event, "e").filter_map(|id| assets.get(id).cloned()).collect(),
         })
         .collect();
+    releases.sort_by(|a, b| (a.created_at, &a.version).cmp(&(b.created_at, &b.version)));
 
-    Ok(Snapshot { application, releases })
+    Snapshot { application, releases }
 }
 
 fn parse_asset(event: &Event) -> Option<Asset> {
@@ -239,7 +252,7 @@ fn has_tag(event: &Event, name: &str, value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
@@ -291,5 +304,62 @@ mod tests {
         assert_eq!(asset(None).name(), "a".repeat(64));
         assert_eq!(asset(Some("../x")).name(), "a".repeat(64));
         assert_eq!(asset(Some("")).name(), "a".repeat(64));
+    }
+
+    const ALICE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const MALLORY: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+
+    fn tags(tags: &[&[&str]]) -> Vec<Vec<String>> {
+        tags.iter().map(|tag| tag.iter().map(|value| value.to_string()).collect()).collect()
+    }
+
+    /// An asset, a release listing it and one that isn't stored, and the
+    /// application, all by `secret`.
+    pub fn published(secret: &str, version: &str, created_at: i64) -> Vec<Event> {
+        let asset = Event::sign(secret, created_at, ASSET, tags(&[&["x", &"a".repeat(64)], &["m", DEB_MIME]]), "");
+        let pubkey = asset.pubkey.clone();
+        let coordinate = format!("{APPLICATION}:{pubkey}:app");
+        let release = Event::sign(
+            secret,
+            created_at,
+            RELEASE,
+            tags(&[
+                &["d", &format!("app@{version}")],
+                &["a", &coordinate],
+                &["i", "app"],
+                &["version", version],
+                &["e", &asset.id],
+                &["e", &"f".repeat(64)],
+            ]),
+            "notes",
+        );
+        let application = Event::sign(secret, created_at, APPLICATION, tags(&[&["d", "app"], &["name", "App"]]), "");
+        vec![asset, release, application]
+    }
+
+    #[test]
+    fn reads_what_an_author_published() {
+        let mut events = published(ALICE, "1.0", 100);
+        let alice = events[0].pubkey.clone();
+        events.extend(published(ALICE, "1.1", 200));
+        // Someone else's release can't add to Alice's application.
+        let mut forged = published(MALLORY, "9.9", 300);
+        for event in &mut forged {
+            for tag in &mut event.tags {
+                if tag[0] == "a" {
+                    tag[1] = format!("{APPLICATION}:{alice}:app");
+                }
+            }
+        }
+        events.extend(forged);
+
+        assert_eq!(applications(&events, &alice), BTreeSet::from(["app".to_string()]));
+        let snapshot = snapshot(&events, &alice, "app");
+        assert_eq!(snapshot.application.unwrap().name.as_deref(), Some("App"));
+        let versions: Vec<&str> = snapshot.releases.iter().map(|release| release.version.as_str()).collect();
+        assert_eq!(versions, ["1.0", "1.1"]);
+        assert_eq!(snapshot.releases[0].assets.len(), 1);
+        assert_eq!(snapshot.releases[0].channel, "main");
+        assert_eq!(missing_assets(&events, &alice), ["f".repeat(64)]);
     }
 }

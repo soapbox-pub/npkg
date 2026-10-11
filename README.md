@@ -1,10 +1,10 @@
 # npkg-gateway
 
-apt and dnf repositories for software released on Nostr.
+apt and dnf repositories for software a team releases on Nostr.
 
-Every NIP-82 application
-that publishes `.deb` or `.rpm` assets gets its own repository, addressed by
-its author and its `d` tag:
+The gateway follows the NIP-82 events of the authors its operator lists, and
+every application they publish gets its own repository, addressed by its
+author and its `d` tag:
 
 ```
 /apt/<owner>/<d>     # Debian, Ubuntu
@@ -31,7 +31,18 @@ sudo dnf install npanel
 ```
 
 Add `?channel=beta` (or `nightly`, `dev`) to a setup URL to follow a
-less stable channel.
+less stable channel. The gateway's front page lists every repository.
+
+## How it stays current
+
+The gateway subscribes to the team's NIP-82 events on its relays, so a
+release shows up in its repositories seconds after it's published. It also
+fetches everything again every hour (`resync_interval`), in case it missed
+an event while a relay was down, and tries again any file it couldn't
+download. Requests are served from memory and never wait on relays.
+
+The events are stored, so a restart serves exactly what was served before,
+without the network, and then catches up.
 
 ## Release files
 
@@ -126,28 +137,41 @@ file against the `sha256` in the release's JSON, which comes from the
 author's signed event.
 
 A repository added by NIP-05 address follows the address: the gateway looks
-it up again every few minutes, so whoever controls the domain decides whose
-packages its users get. Add it by npub to pin the author instead. The lookup
-only goes to public-looking domain names (no IP addresses, ports, or
-single-label hosts), but the gateway doesn't check where those resolve to:
-run it where it can't reach anything private.
+it up again once a day, so whoever controls the domain decides whose
+packages its users get, as long as it's someone on the team. Add it by npub
+to pin the author instead. A key is kept until the domain's `nostr.json`
+stops listing the name or names someone off the team; a domain that's down
+or broken leaves it as it was, through restarts too.
+
+Looking up an address the gateway doesn't know yet is the one thing a
+request can make it do upstream, so those lookups are limited, per client
+and overall. Behind a reverse proxy on the same machine, the client is the
+address the proxy adds last to `X-Forwarded-For`. The lookup only goes to
+public-looking domain names (no IP addresses, ports, or single-label hosts),
+but the gateway doesn't check where those resolve to: run it where it can't
+reach anything private.
 
 ## Running it
 
 ```sh
 cargo build --release
 sudo install -D -m 644 npkg-gateway.example.toml /etc/npkg-gateway/npkg-gateway.toml
-sudoedit /etc/npkg-gateway/npkg-gateway.toml   # set public_url
+sudoedit /etc/npkg-gateway/npkg-gateway.toml   # set public_url and authors
 sudo ./target/release/npkg-gateway keygen
 sudo ./target/release/npkg-gateway serve
 ```
 
 The config file is the one `--config` names, or else the first of
 `~/.config/npkg-gateway/npkg-gateway.toml` and
-`/etc/npkg-gateway/npkg-gateway.toml`. Only `public_url` is required;
-`npkg-gateway.example.toml` lists every setting (the listen address, relays,
-Blossom servers, rebuild interval) with its default. Set `authors` to a list
-of npubs to serve only their repositories; anyone else's gets a 403.
+`/etc/npkg-gateway/npkg-gateway.toml`. `public_url` and `authors`, the npubs
+on the team, are required; `npkg-gateway.example.toml` lists every setting
+(the listen address, relays, Blossom servers, resync interval) with its
+default. An author taken off the list has their events forgotten at the next
+start.
+
+The first start downloads every `.deb` and `.rpm` the team has released, once,
+to read what each one is. Only what it reads is kept: package downloads are
+redirects to Blossom.
 
 `keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
 as root) once. Back it up: every user's setup trusts that key.
