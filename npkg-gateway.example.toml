@@ -1,0 +1,32 @@
+# npkg-gateway configuration. The gateway reads the file --config names, or
+# else the first of ~/.config/npkg-gateway/npkg-gateway.toml and
+# /etc/npkg-gateway/npkg-gateway.toml.
+#
+# Only public_url is required; the rest are shown with their defaults. A key
+# the gateway doesn't know is refused.
+
+# The URL users reach the gateway at, which the setup files point apt and dnf
+# to.
+public_url = "https://pkg.example.com"
+
+# The address and port to listen on. A reverse proxy terminates TLS in front.
+# bind = "127.0.0.1:8080"
+
+# Holds npkg-gateway.sqlite and signing-key.asc. A relative path is relative
+# to this file. Defaults to /var/lib/npkg-gateway as root, else
+# ~/.local/share/npkg-gateway.
+# data_dir = "/var/lib/npkg-gateway"
+
+# Relays to look for NIP-82 events on.
+# relays = ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"]
+
+# Blossom servers to look for package files on, when the URL an asset names
+# doesn't serve it.
+# blossom_servers = ["https://blossom.ditto.pub", "https://blossom.primal.net"]
+
+# How many seconds a repository, or a NIP-05 lookup, is served before it's
+# redone in the background.
+# ttl = 300
+
+# What to log, as tracing EnvFilter directives.
+# log = "info"

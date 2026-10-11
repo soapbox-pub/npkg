@@ -5,6 +5,7 @@
 //! address, built from the author's events and signed with the gateway's key.
 
 mod apt;
+mod config;
 mod db;
 mod http;
 mod inspect;
@@ -14,20 +15,23 @@ mod repo;
 mod rpmmd;
 mod signing;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+use crate::config::Config;
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Where the database and the signing key are kept.
-    #[arg(long, global = true, default_value = "data")]
-    data: PathBuf,
+    /// Configuration file [default: the first that exists of
+    /// $XDG_CONFIG_HOME/npkg-gateway/npkg-gateway.toml
+    /// (~/.config/npkg-gateway/npkg-gateway.toml) and
+    /// /etc/npkg-gateway/npkg-gateway.toml]
+    #[arg(short, long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -41,58 +45,41 @@ enum Command {
         user_id: String,
     },
     /// Serve repositories.
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        listen: SocketAddr,
-        /// The URL users reach the gateway at, for the setup files.
-        #[arg(long)]
-        public_url: Option<String>,
-        /// Relays to look for NIP-82 events on.
-        #[arg(
-            long = "relay",
-            default_values = ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"]
-        )]
-        relays: Vec<String>,
-        /// Blossom servers to look for package files on, when the URL an
-        /// asset names doesn't serve it.
-        #[arg(long = "blossom", default_values = ["https://blossom.ditto.pub", "https://blossom.primal.net"])]
-        blossom: Vec<String>,
-        /// How long a repository is served before it's rebuilt, in seconds.
-        #[arg(long, default_value_t = 300)]
-        ttl: u64,
-    },
+    Serve,
 }
-
-const KEY_FILE: &str = "signing-key.asc";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load(cli.config.as_deref(), &config::Environment::current())?;
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.log).context("log must be tracing EnvFilter directives.")?)
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
-    std::fs::create_dir_all(&cli.data).with_context(|| format!("Couldn't create {}.", cli.data.display()))?;
-    let key_path = cli.data.join(KEY_FILE);
+    std::fs::create_dir_all(&config.data_dir).with_context(|| format!("Couldn't create {}.", config.data_dir.display()))?;
+    let key_path = config.key_path();
 
     match cli.command {
         Command::Keygen { user_id } => {
             let signer = signing::Signer::generate(&key_path, &user_id)?;
             println!("Made {} ({}).", key_path.display(), signer.fingerprint());
         }
-        Command::Serve { listen, public_url, relays, blossom, ttl } => {
+        Command::Serve => {
             let signer = Arc::new(signing::Signer::load(&key_path)?);
-            let db = db::Db::open(&cli.data.join("npkg-gateway.sqlite"))?;
-            let ttl = Duration::from_secs(ttl);
-            let config = repo::Config { relays, blossom, ttl };
-            let repos = repo::Repos::new(config, db, signer)?;
-            let names = nostr::nip05::Resolver::new(ttl)?;
-            let public_url = public_url.unwrap_or_else(|| format!("http://{listen}")).trim_end_matches('/').to_string();
+            let db = db::Db::open(&config.database_path())?;
+            let repos = repo::Repos::new(
+                repo::Config { relays: config.relays.clone(), blossom: config.blossom_servers.clone(), ttl: config.ttl },
+                db,
+                signer,
+            )?;
+            let names = nostr::nip05::Resolver::new(config.ttl)?;
+            let public_url = config.public_url.clone();
             let app = http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone() }));
 
-            let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("Couldn't listen on {listen}."))?;
-            tracing::info!(%listen, public_url, "listening");
+            let bind = config.bind;
+            let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("Couldn't listen on {bind}."))?;
+            tracing::info!(%bind, public_url, config = %config.source.display(), "listening");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;

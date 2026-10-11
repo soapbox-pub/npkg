@@ -1,2 +1,4 @@
 target/
 /data/
+# The development config.
+/npkg-gateway.toml

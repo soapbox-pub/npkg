@@ -78,11 +78,17 @@ run it where it can't reach anything private.
 
 ```sh
 cargo build --release
-./target/release/npkg-gateway --data data keygen
-./target/release/npkg-gateway --data data serve --listen 127.0.0.1:8080 \
-  --public-url https://pkg.example.com
+sudo install -D -m 644 npkg-gateway.example.toml /etc/npkg-gateway/npkg-gateway.toml
+sudoedit /etc/npkg-gateway/npkg-gateway.toml   # set public_url
+sudo ./target/release/npkg-gateway keygen
+sudo ./target/release/npkg-gateway serve
 ```
 
-`keygen` writes `data/signing-key.asc` once. Back it up: every user's setup
-trusts that key. `serve --help` lists the relays and Blossom servers it uses
-by default.
+The config file is the one `--config` names, or else the first of
+`~/.config/npkg-gateway/npkg-gateway.toml` and
+`/etc/npkg-gateway/npkg-gateway.toml`. Only `public_url` is required;
+`npkg-gateway.example.toml` lists every setting (the listen address, relays,
+Blossom servers, rebuild interval) with its default.
+
+`keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
+as root) once. Back it up: every user's setup trusts that key.

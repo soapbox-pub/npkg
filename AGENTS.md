@@ -13,6 +13,7 @@ This is a spike: kept simple on purpose, and revised as we go.
 ```
 src/
   main.rs        the CLI: keygen, serve
+  config.rs      the TOML config file (npkg-gateway.example.toml)
   http.rs        the routes, setup files, and the status page
   repo.rs        building a repository: fetch, inspect, select, pin, render;
                  cached in memory and rebuilt in the background
@@ -31,7 +32,7 @@ tests/fixtures/  tiny real packages nfpm built (see its README)
 
 A request for a repository nobody has asked for yet waits while it's built.
 After that it's served from memory and rebuilt in the background once it's
-older than `--ttl`; a failed rebuild keeps the last good one up.
+older than `ttl`; a failed rebuild keeps the last good one up.
 
 1. Fetch the application, its releases, and their assets from the relays,
    keeping only events signed by the application's author.
@@ -66,8 +67,13 @@ What the unit tests can't show is whether apt and dnf accept the result. To
 check that, run the gateway and install a real package in containers:
 
 ```sh
-cargo run -- --data data keygen   # once
-cargo run -- --data data serve --listen 127.0.0.1:8099
+cat > npkg-gateway.toml <<'EOF'   # once; gitignored
+public_url = "http://127.0.0.1:8099"
+bind = "127.0.0.1:8099"
+data_dir = "data"
+EOF
+cargo run -- -c npkg-gateway.toml keygen   # once
+cargo run -- -c npkg-gateway.toml serve
 N=npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj
 podman run --rm --network host docker.io/library/debian:trixie bash -c "
   apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null &&
@@ -80,3 +86,12 @@ podman run --rm --network host docker.io/library/rockylinux:8 bash -c "
 
 This was last done against npanel 0.6.0 on debian:trixie, ubuntu:24.04,
 fedora:latest and rockylinux:8.
+
+## Committing
+
+**Always commit after making changes.** Once a change passes the checks
+above, commit it; don't leave work uncommitted at the end of a task. One
+commit per coherent change, with a message in the style of `git log`: a
+short subject saying what it does, and a body saying why when it isn't
+obvious. If the tree already had unrelated uncommitted work, commit that
+separately rather than folding it into yours.
