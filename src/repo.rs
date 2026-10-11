@@ -26,7 +26,7 @@ use crate::inspect::{self, Format, Meta};
 use crate::nip82::{self, Asset};
 use crate::nostr::nip19;
 use crate::ostree::delta::{self, Bundle};
-use crate::ostree::{Kind, Store, summary};
+use crate::ostree::{Kind, Store, appstream, summary};
 use crate::signing::Signer;
 use crate::{apt, rpmmd};
 
@@ -86,10 +86,11 @@ pub struct FlatpakBundle {
     pub bundle: Bundle,
 }
 
-/// One channel's Flatpak remote: the newest commit of each ref, and the
-/// signed summary that says so.
+/// One channel's Flatpak remote: the newest commit of each ref, the
+/// AppStream branches that list them, and the signed summary that says so.
 pub struct FlatpakChannel {
     pub refs: Vec<FlatpakBundle>,
+    pub appstream: Vec<Bundle>,
     summary: Vec<u8>,
     summary_sig: Vec<u8>,
 }
@@ -157,6 +158,12 @@ impl Repo {
             "summary.sig" => Some(&channel.summary_sig),
             _ => None,
         }
+    }
+
+    /// Every commit the repository's Flatpak remotes serve, or could: each
+    /// release's, and each channel's AppStream branches'.
+    pub fn commits(&self) -> impl Iterator<Item = &str> {
+        self.commitmeta.keys().map(String::as_str)
     }
 
     /// The signature of one of the repository's commits.
@@ -430,20 +437,25 @@ impl Repos {
             let mut apt = HashMap::new();
             let mut rpm = HashMap::new();
             let mut flatpak = HashMap::new();
+            // The newest app's date, so AppStream commits are made again
+            // the same until an app changes, and never go back in time.
+            let appstream_date = bundles.iter().map(|bundle| bundle.bundle.timestamp).max().unwrap_or(0);
             for (rank, channel) in CHANNELS.iter().enumerate() {
                 let included: Vec<&Package> = packages.iter().filter(|package| package.channel <= rank).collect();
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
                 let refs = flatpak_heads(&releases, &bundles, rank);
                 if !refs.is_empty() {
-                    let summary = summary::render(&refs.iter().map(|head| &head.bundle).collect::<Vec<_>>());
+                    let apps: Vec<&Bundle> = refs.iter().map(|head| &head.bundle).collect();
+                    let appstream = appstream::build(&store, &apps, appstream_date)?;
+                    let summary = summary::render(&apps.iter().copied().chain(&appstream).collect::<Vec<_>>());
                     let summary_sig = summary::signatures(&signer, &summary)?;
-                    flatpak.insert(rank, FlatpakChannel { refs, summary, summary_sig });
+                    flatpak.insert(rank, FlatpakChannel { refs, appstream, summary, summary_sig });
                 }
             }
             let mut commitmeta = HashMap::new();
-            for bundle in &bundles {
-                let commit = &bundle.bundle.commit;
+            let appstream = flatpak.values().flat_map(|channel| channel.appstream.iter().map(|branch| &branch.commit));
+            for commit in bundles.iter().map(|bundle| &bundle.bundle.commit).chain(appstream) {
                 if !commitmeta.contains_key(commit) {
                     commitmeta.insert(commit.clone(), summary::signatures(&signer, &store.read(Kind::Commit, commit)?)?);
                 }
@@ -845,6 +857,9 @@ mod tests {
         assert_eq!(head(3), ["2.0.0-beta.1"]);
         assert!(repo.flatpak_file(0, "summary").is_some() && repo.flatpak_file(0, "summary.sig").is_some());
         assert!(repo.commitmeta(&bundle.commit).is_some());
+        let appstream: Vec<&str> = repo.flatpak(0).unwrap().appstream.iter().map(|branch| branch.ref_name.as_str()).collect();
+        assert_eq!(appstream, ["appstream/x86_64", "appstream2/x86_64"]);
+        assert_eq!(repo.commits().count(), 3);
         assert!(repo.flatpak_file(0, "config").is_none());
     }
 

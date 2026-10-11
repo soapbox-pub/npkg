@@ -138,9 +138,14 @@ the app and adds the remote; a `.flatpakrepo` only adds the remote. The
 runtime an app needs comes from Flathub, which the `.flatpakref` names.
 
 Every commit any release lists is kept, so downgrades work; objects nothing
-needs any more are pruned once a day. The repositories don't carry
-AppStream data yet, so GNOME Software and Discover don't list their apps,
-though they install a `.flatpakref` fine.
+needs any more are pruned once a day.
+
+Each remote also has AppStream branches (`appstream/<arch>` and
+`appstream2/<arch>`), made the way `flatpak build-update-repo` makes them,
+so GNOME Software, Discover and `flatpak search` show its apps with their
+names, descriptions and icons. They're made from the AppStream data
+`flatpak-builder` puts in each app, `files/share/app-info/`; an app built
+without it installs, but isn't listed.
 
 The channels are `stable`, `beta`, `nightly` and `dev`: an apt suite or a
 dnf repository each. Each one includes every more stable channel, so `beta`

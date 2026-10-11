@@ -32,7 +32,8 @@ const PART_VERSION: u32 = 0;
 /// The most a part may unpack to: twice the size of any app this serves.
 const MAX_PART: u64 = 8 << 30;
 
-/// A commit a bundle carried, as the summary describes it.
+/// A commit a bundle carried, or one the gateway made, as the summary
+/// describes it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bundle {
     pub commit: String,
@@ -328,7 +329,7 @@ mod tests {
     use super::*;
 
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/hello.flatpak");
-    const COMMIT: &str = "e4ac6214d95a1e8fdb20a63f534f49da0a616da573fc9738b00110510ce2dd27";
+    const COMMIT: &str = "e0e10311738a5fbacfece93c27b03d87579beb663a2644b4032d74f1da59ca8e";
 
     fn bundle_file(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
         let path = dir.join("bundle.flatpak");
@@ -345,10 +346,10 @@ mod tests {
         assert_eq!(bundle.ref_name, "app/org.example.Hello/x86_64/stable");
         assert!(bundle.metadata.contains("command=hello"));
         assert_eq!(bundle.timestamp, 1_767_225_600);
-        assert_eq!(bundle.commit_size, 612);
+        assert_eq!(bundle.commit_size, 628);
         // Every object `flatpak build-export` made: see tests/fixtures/README.md.
         let objects = store.reachable(COMMIT).unwrap();
-        assert_eq!(objects.len(), 13);
+        assert_eq!(objects.len(), 22);
         let mut listed: Vec<String> =
             store.list().unwrap().into_iter().map(|(kind, checksum, _)| format!("{checksum}.{}", kind.extension())).collect();
         listed.sort();

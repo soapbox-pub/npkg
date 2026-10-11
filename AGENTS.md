@@ -34,7 +34,8 @@ src/
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
   ostree/        Flatpak: unpacking bundles (delta.rs) into an archive-z2
-                 object store, pruning it, and summaries (summary.rs)
+                 object store, pruning it, AppStream branches
+                 (appstream.rs), and summaries (summary.rs)
   gvariant.rs    GLib's serialization, which OSTree's formats are made of
   signing.rs     the gateway's Ed25519 OpenPGP key
   db.rs          SQLite: the team's events, inspected package files,
@@ -79,7 +80,9 @@ one up.
    not by the build, so rebuilding the same packages gives the same files
    and a client between two requests never sees hashes change underneath it.
    A channel's Flatpak summary names the newest commit of each ref, and is
-   dated by it.
+   dated by it, and its AppStream branches, made from those commits'
+   AppStream data and dated by the repository's newest commit, so the
+   same apps give the same branches.
 
 Once a day, after a resync, the sync worker prunes the OSTree store of
 objects no current release's commit reaches, if they're over a day old.
@@ -132,7 +135,8 @@ fedora:latest container (with `--network host`, and `flatpak` installed) was
 checked against Armada 0.64.7-0.64.11: install, `update --commit=` to an
 older commit and back, `repair` after deleting an object, and an install
 from a gateway restarted with its relays unreachable. An `ostree pull` from
-0.64.7 to 0.64.11 fetched 9 objects (6 MB) of 599.
+0.64.7 to 0.64.11 fetched 9 objects (6 MB) of 599. `flatpak update
+--appstream` then `flatpak search armada` found it, with its icons.
 
 ## Committing
 

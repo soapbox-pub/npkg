@@ -110,7 +110,7 @@ impl Worker {
     /// Delete the objects no repository's bundles need.
     async fn prune(&self) {
         let keep: HashSet<String> =
-            self.repos.all().iter().flat_map(|repo| repo.bundles.iter().map(|bundle| bundle.bundle.commit.clone())).collect();
+            self.repos.all().iter().flat_map(|repo| repo.commits().map(str::to_string).collect::<Vec<_>>()).collect();
         let store = self.repos.store().clone();
         match tokio::task::spawn_blocking(move || store.prune(&keep, PRUNE_GRACE)).await {
             Ok(Ok((0, _))) => {}
