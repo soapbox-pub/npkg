@@ -11,6 +11,7 @@ mod db;
 mod gvariant;
 mod http;
 mod inspect;
+mod net;
 mod nip82;
 mod nostr;
 mod ostree;

@@ -193,9 +193,13 @@ Looking up an address the gateway doesn't know yet is the one thing a
 request can make it do upstream, so those lookups are limited, per client
 and overall. Behind a reverse proxy on the same machine, the client is the
 address the proxy adds last to `X-Forwarded-For`. The lookup only goes to
-public-looking domain names (no IP addresses, ports, or single-label hosts),
-but the gateway doesn't check where those resolve to: run it where it can't
-reach anything private.
+domain names (no IP addresses, ports, or single-label hosts) that resolve
+to public addresses.
+
+Package files and bundles are downloaded from the URL the author gives, if
+it's https at a public address, and then from the configured Blossom
+servers. Redirects are followed, up to five, only to public https URLs. The
+Blossom servers themselves may be anywhere: they're the operator's.
 
 ## Running it
 

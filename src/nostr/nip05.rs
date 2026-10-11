@@ -135,6 +135,8 @@ impl Resolver {
             .timeout(Duration::from_secs(10))
             // NIP-05: fetchers must ignore redirects.
             .redirect(reqwest::redirect::Policy::none())
+            // A domain anyone names could resolve to what's private here.
+            .dns_resolver(crate::net::PublicResolver::new([]))
             .build()?;
         let limits = Limits { clients: RateLimiter::new(PER_CLIENT, MAX_CLIENTS), overall: RateLimiter::new(OVERALL, 1) };
         Ok(Arc::new(Resolver {

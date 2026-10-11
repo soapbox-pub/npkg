@@ -29,6 +29,8 @@ src/
   nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (stored,
                  refreshed daily, limited per client), relay queries and
                  subscriptions
+  net.rs         keeping requests others point the gateway at (NIP-05
+                 lookups, downloads) to public addresses
   rate_limit.rs  token buckets, after npanel's
   inspect/       reading a .deb's control file and an .rpm's header
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches

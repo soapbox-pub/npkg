@@ -28,7 +28,7 @@ use crate::nostr::nip19;
 use crate::ostree::delta::{self, Bundle};
 use crate::ostree::{Kind, Store, appstream, summary};
 use crate::signing::Signer;
-use crate::{apt, rpmmd};
+use crate::{apt, net, rpmmd};
 
 /// The channels a repository offers, most stable first: apt suites, and dnf
 /// repositories. Each holds its own releases and every more stable channel's,
@@ -222,11 +222,15 @@ pub struct Repos {
 
 impl Repos {
     pub fn new(blossom: Vec<String>, db: Db, store: Store, signer: Arc<Signer>) -> anyhow::Result<Arc<Repos>> {
+        // Authors name the URLs, and Blossom servers redirect where they
+        // like: only the configured servers may be private.
+        let trusted = blossom.iter().filter_map(|server| reqwest::Url::parse(server).ok()?.host_str().map(str::to_string));
         let http = reqwest::Client::builder()
             .user_agent(concat!("npkg-gateway/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(net::redirect_policy())
+            .dns_resolver(net::PublicResolver::new(trusted))
             .build()?;
         Ok(Arc::new(Repos { blossom, db, store, http, signer, built: Default::default(), synced: AtomicBool::new(false) }))
     }
@@ -503,8 +507,7 @@ impl Repos {
         // Only a file whose download failed last time gets here.
         anyhow::ensure!(!offline, "The file isn't downloaded yet. It will be tried again when the repository is next refreshed.");
 
-        let mut urls: Vec<String> = asset.url.iter().filter(|url| url.starts_with("https://")).cloned().collect();
-        urls.extend(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
+        let urls = self.urls(asset);
 
         let mut last_error = anyhow::anyhow!("The asset has no https URL, and no Blossom server is configured.");
         for url in urls {
@@ -544,8 +547,7 @@ impl Repos {
         }
         anyhow::ensure!(!offline, "The bundle isn't unpacked yet. It will be tried again when the repository is next refreshed.");
 
-        let mut urls: Vec<String> = asset.url.iter().filter(|url| url.starts_with("https://")).cloned().collect();
-        urls.extend(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
+        let urls = self.urls(asset);
 
         let mut last_error = anyhow::anyhow!("The asset has no https URL, and no Blossom server is configured.");
         for url in urls {
@@ -564,6 +566,13 @@ impl Repos {
             return Ok(bundle);
         }
         Err(last_error.context(format!("Couldn't download the bundle {}", asset.sha256)))
+    }
+
+    /// Where to look for `asset`: its own URL, if it's a public https one,
+    /// then each Blossom server.
+    fn urls(&self, asset: &Asset) -> Vec<String> {
+        let own = asset.url.iter().filter(|url| reqwest::Url::parse(url).is_ok_and(|url| net::is_public_url(&url))).cloned();
+        own.chain(self.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256))).collect()
     }
 
     /// Download `url` into a temporary file in the store, checking it's the
