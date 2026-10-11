@@ -30,3 +30,8 @@ public_url = "https://pkg.example.com"
 
 # What to log, as tracing EnvFilter directives.
 # log = "info"
+
+# Serve only these authors' repositories, as npubs or hex public keys. Left
+# out, the gateway serves anyone's. A listed author's repositories can still
+# be reached by any NIP-05 address that names them.
+# authors = ["npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj"]

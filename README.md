@@ -88,7 +88,8 @@ The config file is the one `--config` names, or else the first of
 `~/.config/npkg-gateway/npkg-gateway.toml` and
 `/etc/npkg-gateway/npkg-gateway.toml`. Only `public_url` is required;
 `npkg-gateway.example.toml` lists every setting (the listen address, relays,
-Blossom servers, rebuild interval) with its default.
+Blossom servers, rebuild interval) with its default. Set `authors` to a list
+of npubs to serve only their repositories; anyone else's gets a 403.
 
 `keygen` writes `signing-key.asc` into `data_dir` (`/var/lib/npkg-gateway`
 as root) once. Back it up: every user's setup trusts that key.

@@ -75,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
             )?;
             let names = nostr::nip05::Resolver::new(config.ttl)?;
             let public_url = config.public_url.clone();
-            let app = http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone() }));
+            let app =
+                http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone(), authors: config.authors.clone() }));
 
             let bind = config.bind;
             let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("Couldn't listen on {bind}."))?;

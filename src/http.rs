@@ -9,7 +9,7 @@
 // add noise to every call.
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -29,6 +29,8 @@ pub struct AppState {
     pub names: Resolver,
     /// Where the gateway is reached, for the setup files: no trailing slash.
     pub public_url: String,
+    /// The hex pubkeys whose repositories are served, or `None` for anyone's.
+    pub authors: Option<HashSet<String>>,
 }
 
 type Shared = State<Arc<AppState>>;
@@ -85,6 +87,14 @@ async fn repo(state: &AppState, owner_value: &str, d: &str) -> Result<(Arc<Repo>
         return Err(error(StatusCode::NOT_FOUND, format!("{d:?} isn't an application id this gateway can serve.")));
     }
     let (pubkey, owner) = owner(state, owner_value).await?;
+    // Checked before building, so an author nobody listed costs no relay
+    // queries or downloads.
+    if state.authors.as_ref().is_some_and(|authors| !authors.contains(&pubkey)) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            format!("This gateway only serves repositories for the authors its operator lists, and {owner} isn't one of them."),
+        ));
+    }
     let repo = state.repos.get(&pubkey, d).await.map_err(|failure| match failure {
         BuildError::NotFound(message) => error(StatusCode::NOT_FOUND, message),
         BuildError::Failed(message) => error(StatusCode::BAD_GATEWAY, message),

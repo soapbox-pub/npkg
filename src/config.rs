@@ -6,12 +6,15 @@
 //! `npkg-gateway.example.toml` lists every key with its default. Only
 //! `public_url` is required.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+
+use crate::nostr::nip19;
 
 /// Where a packaged gateway's configuration is.
 pub const SYSTEM_PATH: &str = "/etc/npkg-gateway/npkg-gateway.toml";
@@ -43,6 +46,8 @@ pub struct Config {
     pub ttl: Duration,
     /// What to log, as `tracing_subscriber`'s `EnvFilter` directives.
     pub log: String,
+    /// The hex pubkeys whose repositories are served, or `None` for anyone's.
+    pub authors: Option<HashSet<String>>,
 }
 
 /// The file as written. Every key is optional but `public_url`, and a key the
@@ -57,6 +62,7 @@ struct File {
     blossom_servers: Option<Vec<String>>,
     ttl: Option<u64>,
     log: Option<String>,
+    authors: Option<Vec<String>>,
 }
 
 /// What the defaults depend on, read once so that tests can supply their own.
@@ -165,7 +171,29 @@ impl Config {
 
         let log = file.log.unwrap_or_else(|| "info".into());
 
-        Ok(Self { source, bind, public_url, data_dir, relays, blossom_servers, ttl, log })
+        // Keys only: a NIP-05 address here would hand the list to whoever
+        // controls the domain, and its lookup could fail at startup.
+        let authors = match file.authors {
+            None => None,
+            Some(authors) if authors.is_empty() => {
+                bail!("authors must list at least one npub, or be left out to serve anyone's repositories.")
+            }
+            Some(authors) => Some(
+                authors
+                    .iter()
+                    .map(|author| {
+                        let author = author.trim();
+                        match nip19::decode(author) {
+                            Ok(nip19::Decoded::Npub(pubkey)) => Ok(pubkey),
+                            _ if author.len() == 64 && author.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(author.to_ascii_lowercase()),
+                            _ => bail!("authors must be npubs or hex public keys, and {author:?} is neither."),
+                        }
+                    })
+                    .collect::<Result<HashSet<_>>>()?,
+            ),
+        };
+
+        Ok(Self { source, bind, public_url, data_dir, relays, blossom_servers, ttl, log, authors })
     }
 
     /// Path of the SQLite database file.
@@ -226,6 +254,18 @@ mod tests {
         assert_eq!(c.blossom_servers, DEFAULT_BLOSSOM_SERVERS);
         assert_eq!(c.ttl, Duration::from_secs(300));
         assert_eq!(c.log, "info");
+        assert_eq!(c.authors, None);
+    }
+
+    #[test]
+    fn authors_are_npubs_or_hex() {
+        let hex = "781a1527055f74c1f70230f10384609b34548f8ab6a0a6caa74025827f9fdae5";
+        let npub = "npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj";
+        let c = config(&format!("public_url = \"http://x\"\nauthors = [\"{npub}\", \"{}\"]", hex.to_uppercase())).unwrap();
+        assert_eq!(c.authors, Some(HashSet::from([hex.to_string()])));
+        assert!(config("public_url = \"http://x\"\nauthors = []").is_err());
+        assert!(config("public_url = \"http://x\"\nauthors = [\"soapbox.pub\"]").is_err());
+        assert!(config("public_url = \"http://x\"\nauthors = [\"npub1\"]").is_err());
     }
 
     #[test]
