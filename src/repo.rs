@@ -508,11 +508,16 @@ impl Repos {
 
         let mut last_error = anyhow::anyhow!("The asset has no https URL, and no Blossom server is configured.");
         for url in urls {
-            match self.download(&url, &asset.sha256).await {
-                Ok(bytes) => {
-                    let size = bytes.len() as u64;
-                    let meta =
-                        tokio::task::spawn_blocking(move || inspect::inspect(format, &bytes)).await?.map_err(|error| format!("{error:#}"));
+            match self.download_to_file(&url, &asset.sha256).await {
+                Ok(file) => {
+                    let (size, meta) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        let size = file.as_file().metadata()?.len();
+                        // SAFETY: the gateway's own download, which nothing
+                        // writes to while it's mapped.
+                        let map = unsafe { memmap2::Mmap::map(file.as_file())? };
+                        Ok((size, inspect::inspect(format, &map).map_err(|error| format!("{error:#}"))))
+                    })
+                    .await??;
                     let inspected = Inspected { size, url, meta };
                     self.db.store_inspected(&asset.sha256, &inspected).await?;
                     return Ok(inspected);
@@ -562,7 +567,8 @@ impl Repos {
     }
 
     /// Download `url` into a temporary file in the store, checking it's the
-    /// file with hash `sha256`. Bundles are too big to hold in memory.
+    /// file with hash `sha256`. Files can be hundreds of megabytes, and
+    /// several download at once: too much to hold in memory.
     async fn download_to_file(&self, url: &str, sha256: &str) -> anyhow::Result<tempfile::NamedTempFile> {
         use tokio::io::AsyncWriteExt;
         let response = self.http.get(url).send().await?.error_for_status()?;
@@ -586,24 +592,6 @@ impl Repos {
         let actual = hex::encode(hasher.finalize());
         anyhow::ensure!(actual == sha256, "{url} served a file whose sha256 is {actual}, not {sha256}.");
         Ok(file)
-    }
-
-    async fn download(&self, url: &str, sha256: &str) -> anyhow::Result<Vec<u8>> {
-        let response = self.http.get(url).send().await?.error_for_status()?;
-        if response.content_length().is_some_and(|length| length > MAX_PACKAGE) {
-            anyhow::bail!("{url} is larger than {MAX_PACKAGE} bytes.");
-        }
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk?);
-            if bytes.len() as u64 > MAX_PACKAGE {
-                anyhow::bail!("{url} is larger than {MAX_PACKAGE} bytes.");
-            }
-        }
-        let actual = hex::encode(Sha256::digest(&bytes));
-        anyhow::ensure!(actual == sha256, "{url} served a file whose sha256 is {actual}, not {sha256}.");
-        Ok(bytes)
     }
 }
 

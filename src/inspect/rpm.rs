@@ -215,6 +215,7 @@ pub fn inspect(bytes: &[u8]) -> anyhow::Result<RpmMeta> {
         enhances: header.dependencies(tag::ENHANCENAME, tag::ENHANCEFLAGS, tag::ENHANCEVERSION)?,
         files,
     };
+    ensure!(!header.exhausted() && !signature.exhausted(), "The .rpm's header takes too much memory to read.");
     ensure!(!meta.name.is_empty() && !meta.version.is_empty() && !meta.arch.is_empty(), "The .rpm has no name, version or architecture.");
     Ok(meta)
 }
@@ -223,7 +224,17 @@ pub fn inspect(bytes: &[u8]) -> anyhow::Result<RpmMeta> {
 struct Header<'a> {
     entries: Vec<Entry>,
     store: &'a [u8],
+    /// How many more bytes reading values may make, counting each string's
+    /// own overhead. Entries can point at the same data, and a count can
+    /// say billions of empty strings, so without a budget a small header
+    /// could make gigabytes. Past it, values read as empty, and
+    /// [`Header::exhausted`] says so.
+    budget: std::cell::Cell<usize>,
 }
+
+/// What reading a header's values may make beyond the size of its data:
+/// enough for a few hundred thousand files' worth of lists.
+const VALUE_OVERHEAD: usize = 64 << 20;
 
 struct Entry {
     tag: u32,
@@ -259,11 +270,31 @@ impl<'a> Header<'a> {
                 Entry { tag: word(0), kind: word(4), offset: word(8) as usize, count: word(12) as usize }
             })
             .collect();
-        Ok((Header { entries, store: &bytes[index_end..len] }, len))
+        let budget = std::cell::Cell::new(store_len.saturating_mul(2).saturating_add(VALUE_OVERHEAD));
+        Ok((Header { entries, store: &bytes[index_end..len], budget }, len))
     }
 
     fn entry(&self, tag: u32) -> Option<&Entry> {
         self.entries.iter().find(|entry| entry.tag == tag)
+    }
+
+    /// Spend `bytes` of the budget, or say there isn't enough left.
+    fn spend(&self, bytes: usize) -> bool {
+        match self.budget.get().checked_sub(bytes) {
+            Some(left) => {
+                self.budget.set(left);
+                true
+            }
+            None => {
+                self.budget.set(0);
+                false
+            }
+        }
+    }
+
+    /// Whether reading values ran out of budget, so some read as empty.
+    fn exhausted(&self) -> bool {
+        self.budget.get() == 0
     }
 
     fn strings(&self, tag: u32) -> Vec<String> {
@@ -276,6 +307,9 @@ impl<'a> Header<'a> {
         let mut rest = self.store.get(entry.offset..).unwrap_or_default();
         for _ in 0..count {
             let Some(end) = rest.iter().position(|&b| b == 0) else { break };
+            if !self.spend(end + size_of::<String>()) {
+                return Vec::new();
+            }
             out.push(String::from_utf8_lossy(&rest[..end]).into_owned());
             rest = &rest[end + 1..];
         }
@@ -294,6 +328,9 @@ impl<'a> Header<'a> {
             _ => return Vec::new(),
         };
         let Some(data) = self.store.get(entry.offset..entry.offset + entry.count * width) else { return Vec::new() };
+        if !self.spend(entry.count * 4) {
+            return Vec::new();
+        }
         data.chunks_exact(width)
             .map(|b| if width == 2 { u16::from_be_bytes([b[0], b[1]]).into() } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) })
             .collect()
@@ -302,6 +339,9 @@ impl<'a> Header<'a> {
     fn int64s(&self, tag: u32) -> Vec<u64> {
         let Some(entry) = self.entry(tag).filter(|entry| entry.kind == TYPE_INT64) else { return Vec::new() };
         let Some(data) = self.store.get(entry.offset..entry.offset + entry.count * 8) else { return Vec::new() };
+        if !self.spend(entry.count * 8) {
+            return Vec::new();
+        }
         data.as_chunks::<8>().0.iter().map(|b| u64::from_be_bytes(*b)).collect()
     }
 
@@ -346,6 +386,28 @@ mod tests {
     fn refuses_what_isnt_an_rpm() {
         assert!(inspect(b"").is_err());
         assert!(inspect(&[0u8; 200]).is_err());
+    }
+
+    #[test]
+    fn refuses_a_header_that_takes_too_much_to_read() {
+        let header = |entries: &[[u32; 4]], store: &[u8]| {
+            let mut out = HEADER_MAGIC.to_vec();
+            out.extend([0; 4]);
+            out.extend((entries.len() as u32).to_be_bytes());
+            out.extend((store.len() as u32).to_be_bytes());
+            for entry in entries {
+                entry.iter().for_each(|word| out.extend(word.to_be_bytes()));
+            }
+            out.extend(store);
+            out
+        };
+        let mut rpm = vec![0xed, 0xab, 0xee, 0xdb];
+        rpm.resize(LEAD_SIZE, 0);
+        rpm.extend(header(&[], &[]));
+        // Billions of empty file names, from 16 MiB of NULs.
+        rpm.extend(header(&[[tag::BASENAMES, TYPE_STRING_ARRAY, 0, u32::MAX]], &vec![0; 16 << 20]));
+        let error = inspect(&rpm).unwrap_err();
+        assert!(format!("{error:#}").contains("too much memory"), "{error:#}");
     }
 
     /// A real package nfpm built: see tests/fixtures/README.md.

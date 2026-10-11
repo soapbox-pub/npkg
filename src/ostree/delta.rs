@@ -237,8 +237,10 @@ fn execute(payload: &[u8], objects: &[u8], store: &Store) -> Result<()> {
     };
 
     let mut next = objects.iter();
-    // A file `open` started and `write` is filling, until `close`.
-    let mut open: Option<(Kind, String, FileMeta, Vec<u8>)> = None;
+    // A file `open` started and `write` is filling, until `close`: its
+    // checksum, its metadata, the size it said it is, and what's written
+    // so far. Written to disk, since one can be as big as a part.
+    let mut open: Option<(String, FileMeta, u64, Pieces)> = None;
     while let Some(op) = ops.byte() {
         match op {
             b'S' => {
@@ -266,16 +268,18 @@ fn execute(payload: &[u8], objects: &[u8], store: &Store) -> Result<()> {
                 let meta = file_meta(&mut ops)?;
                 let size = ops.varint()?;
                 ensure!(size <= MAX_PART, "It opens a file of {size} bytes.");
-                open = Some((*kind, checksum.clone(), meta, Vec::with_capacity(size as usize)));
+                open = Some((checksum.clone(), meta, size, Pieces::new(store)?));
             }
             b'w' => {
                 let (length, offset) = (ops.varint()?, ops.varint()?);
-                let (_, _, _, content) = open.as_mut().ok_or_else(|| anyhow!("It writes with no object open."))?;
-                content.extend_from_slice(slice(offset, length)?);
+                let (_, _, size, pieces) = open.as_mut().ok_or_else(|| anyhow!("It writes with no object open."))?;
+                ensure!(pieces.written.saturating_add(length) <= *size, "It writes more into a file than the file's size.");
+                pieces.write(slice(offset, length)?)?;
             }
             b'c' => {
-                let (_, checksum, meta, content) = open.take().ok_or_else(|| anyhow!("It closes with no object open."))?;
-                write_file(store, &checksum, &meta, &content)?;
+                let (checksum, meta, size, pieces) = open.take().ok_or_else(|| anyhow!("It closes with no object open."))?;
+                ensure!(pieces.written == size, "It closes a file before writing all of it.");
+                pieces.finish(|content| write_file(store, &checksum, &meta, content))?;
             }
             b'r' | b'R' | b'B' => bail!("It patches an object the client already has, which a bundle can't."),
             other => bail!("It has an operation {other:?} OSTree doesn't."),
@@ -284,6 +288,35 @@ fn execute(payload: &[u8], objects: &[u8], store: &Store) -> Result<()> {
     ensure!(open.is_none(), "It ends with an object still open.");
     ensure!(next.next().is_none(), "It makes fewer objects than it lists.");
     Ok(())
+}
+
+/// A file being written in pieces, in a temporary file.
+struct Pieces {
+    file: BufWriter<File>,
+    written: u64,
+}
+
+impl Pieces {
+    fn new(store: &Store) -> Result<Pieces> {
+        Ok(Pieces { file: BufWriter::new(tempfile::tempfile_in(store.tmp())?), written: 0 })
+    }
+
+    fn write(&mut self, piece: &[u8]) -> Result<()> {
+        self.file.write_all(piece)?;
+        self.written += piece.len() as u64;
+        Ok(())
+    }
+
+    /// Call `f` with everything written.
+    fn finish(self, f: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
+        let file = self.file.into_inner().map_err(|error| error.into_error())?;
+        if self.written == 0 {
+            return f(&[]);
+        }
+        // SAFETY: an anonymous temporary file only this function holds.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        f(&map)
+    }
 }
 
 fn write_file(store: &Store, expected: &str, meta: &FileMeta, content: &[u8]) -> Result<()> {
@@ -384,6 +417,46 @@ mod tests {
         let bundle = unpack(Path::new(&path), &store).unwrap();
         let objects = store.reachable(&bundle.commit).unwrap().len();
         eprintln!("{} {} objects in {:?}: {bundle:?}", bundle.ref_name, objects, started.elapsed());
+    }
+
+    /// A part that writes one file, `hello world`, in pieces with `ops`.
+    fn part_in_pieces(ops: &[u8]) -> (Vec<u8>, Vec<u8>, String) {
+        let meta = FileMeta::plain_file();
+        let checksum = super::super::file_checksum(&meta, b"hello world").unwrap();
+        let part = Value::Tuple(vec![
+            Value::Array(
+                Type::parse("(uuu)").unwrap(),
+                vec![Value::Tuple(vec![Value::U32(0), Value::U32(0), Value::U32(meta.mode.swap_bytes())])],
+            ),
+            Value::Array(Type::parse("a(ayay)").unwrap(), vec![Value::Array(Type::parse("(ayay)").unwrap(), Vec::new())]),
+            Value::bytes(b"hello world".to_vec()),
+            Value::bytes(ops.to_vec()),
+        ]);
+        let mut objects = vec![1u8];
+        objects.extend(hex::decode(&checksum).unwrap());
+        (part.to_bytes(), objects, checksum)
+    }
+
+    #[test]
+    fn writes_a_file_in_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("ostree")).unwrap();
+        // Open mode 0, xattrs 0, 11 bytes; write 6 at 0, then 5 at 6; close.
+        let (part, objects, checksum) = part_in_pieces(&[b'o', 0, 0, 11, b'w', 6, 0, b'w', 5, 6, b'c']);
+        execute(&part, &objects, &store).unwrap();
+        assert!(store.has(Kind::File, &checksum));
+
+        // Writing past the size it opened with, however often, is refused.
+        let mut ops = vec![b'o', 0, 0, 11];
+        for _ in 0..3 {
+            ops.extend([b'w', 6, 0]);
+        }
+        ops.push(b'c');
+        let (part, objects, _) = part_in_pieces(&ops);
+        assert!(execute(&part, &objects, &store).is_err());
+        // So is closing it short.
+        let (part, objects, _) = part_in_pieces(&[b'o', 0, 0, 11, b'w', 6, 0, b'c']);
+        assert!(execute(&part, &objects, &store).is_err());
     }
 
     #[test]
