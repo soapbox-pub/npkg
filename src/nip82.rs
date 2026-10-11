@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::nostr::{Event, is_hex64, relay};
@@ -23,13 +24,13 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(6);
 /// Asset ids asked for in one filter.
 const IDS_PER_FILTER: usize = 200;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Application {
     pub name: Option<String>,
     pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Release {
     pub version: String,
     pub channel: String,
@@ -39,7 +40,7 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Asset {
     pub mime: String,
     pub sha256: String,
@@ -61,8 +62,9 @@ impl Asset {
     }
 }
 
-/// Everything one application's author has published about it.
-#[derive(Clone, Debug, Default)]
+/// Everything one application's author has published about it. Stored, so
+/// a restart can rebuild a repository without asking relays.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub application: Option<Application>,
     pub releases: Vec<Release>,

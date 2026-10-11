@@ -17,7 +17,8 @@ src/
   http.rs        the routes, setup files, the status page, and release JSON
                  and downloads (/releases/<owner>/<d>)
   repo.rs        building a repository: fetch, inspect, select, pin, render;
-                 cached in memory and rebuilt in the background
+                 cached in memory, rebuilt in the background, and rebuilt
+                 offline from the stored snapshot after a restart
   nip82.rs       application, release and asset events, fetched from relays
   nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (stored,
                  and refreshed in the background), one-shot relay queries
@@ -25,7 +26,8 @@ src/
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml
   signing.rs     the gateway's Ed25519 OpenPGP key
-  db.rs          SQLite: inspected package files, pins, NIP-05 keys
+  db.rs          SQLite: inspected package files, pins, NIP-05 keys,
+                 and relay snapshots
 tests/fixtures/  tiny real packages nfpm built (see its README)
 ```
 
@@ -34,6 +36,12 @@ tests/fixtures/  tiny real packages nfpm built (see its README)
 A request for a repository nobody has asked for yet waits while it's built.
 After that it's served from memory and rebuilt in the background once it's
 older than `ttl`; a failed rebuild keeps the last good one up.
+
+What the relays said (step 1) is stored once it builds. After a restart, a
+repository is rebuilt from that without the network, in milliseconds, since
+everything steps 2 and 3 need is in SQLite too; then it's refreshed in the
+background like any other once it's older than `ttl`. Only a repository the
+gateway has never built makes a request wait on relays.
 
 1. Fetch the application, its releases, and their assets from the relays,
    keeping only events signed by the application's author.
@@ -86,7 +94,8 @@ podman run --rm --network host docker.io/library/rockylinux:8 bash -c "
 ```
 
 This was last done against npanel 0.6.0 on debian:trixie, ubuntu:24.04,
-fedora:latest and rockylinux:8.
+fedora:latest and rockylinux:8, and against npanel 0.6.1 on debian:trixie
+and rockylinux:8 from a gateway restarted with its relays unreachable.
 
 ## Committing
 

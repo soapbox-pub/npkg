@@ -9,7 +9,9 @@
 //!
 //! A repository is built the first time it's asked for, and that request
 //! waits. After that it's served from memory, and rebuilt in the background
-//! once it's older than the TTL, so no later request waits on relays.
+//! once it's older than the TTL, so no later request waits on relays. What
+//! relays said is stored, so after a restart a repository is rebuilt from
+//! that, without the network, and refreshed in the background as before.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -158,7 +160,8 @@ pub enum BuildError {
 type BuildResult = Result<Arc<Repo>, BuildError>;
 
 struct Built {
-    at: Instant,
+    /// When the next request rebuilds it.
+    refresh_at: Instant,
     result: BuildResult,
 }
 
@@ -198,9 +201,11 @@ impl Repos {
         let slot = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(key.clone()).or_default().clone();
 
         let mut state = slot.state.lock().await;
+        if state.is_none() {
+            *state = self.stored(pubkey, d).await;
+        }
         if let Some(built) = &*state {
-            let ttl = if built.result.is_ok() { self.config.ttl } else { FAILURE_TTL };
-            if built.at.elapsed() < ttl {
+            if Instant::now() < built.refresh_at {
                 return built.result.clone();
             }
             if built.result.is_ok() {
@@ -210,7 +215,7 @@ impl Repos {
                         let result = repos.build(&key.0, &key.1).await;
                         let mut state = slot.state.lock().await;
                         match result {
-                            Ok(repo) => *state = Some(Built { at: Instant::now(), result: Ok(repo) }),
+                            Ok(repo) => *state = Some(Built { refresh_at: Instant::now() + repos.config.ttl, result: Ok(repo) }),
                             // What was built last stays up while relays or
                             // servers are failing.
                             Err(error) => tracing::warn!(pubkey = key.0, d = key.1, ?error, "rebuild failed"),
@@ -223,12 +228,32 @@ impl Repos {
         }
 
         let result = self.build(pubkey, d).await;
-        *state = Some(Built { at: Instant::now(), result: result.clone() });
+        let ttl = if result.is_ok() { self.config.ttl } else { FAILURE_TTL };
+        *state = Some(Built { refresh_at: Instant::now() + ttl, result: result.clone() });
         result
     }
 
+    /// The repository as relays last described it, before this process
+    /// started, built without the network. It's as old as that answer is.
+    async fn stored(&self, pubkey: &str, d: &str) -> Option<Built> {
+        let (snapshot, age) = match self.db.snapshot(pubkey, d).await {
+            Ok(row) => row?,
+            Err(error) => {
+                tracing::warn!(pubkey, d, ?error, "couldn't read a stored snapshot");
+                return None;
+            }
+        };
+        match self.assemble(pubkey, d, &snapshot, true).await {
+            Ok(repo) => Some(Built { refresh_at: Instant::now() + self.config.ttl.saturating_sub(age), result: Ok(repo) }),
+            Err(error) => {
+                tracing::warn!(pubkey, d, ?error, "couldn't build from a stored snapshot");
+                None
+            }
+        }
+    }
+
+    /// Ask relays, build, and store what they said once it builds.
     async fn build(&self, pubkey: &str, d: &str) -> BuildResult {
-        let started = Instant::now();
         let snapshot = nip82::fetch(&self.config.relays, pubkey, d).await.map_err(|error| BuildError::Failed(format!("{error:#}")))?;
         if snapshot.application.is_none() && snapshot.releases.is_empty() {
             return Err(BuildError::NotFound(format!(
@@ -236,7 +261,17 @@ impl Repos {
                 nip19::npub_encode(pubkey)
             )));
         }
+        let repo = self.assemble(pubkey, d, &snapshot, false).await?;
+        if let Err(error) = self.db.store_snapshot(pubkey, d, &snapshot).await {
+            tracing::warn!(pubkey, d, ?error, "couldn't store a snapshot");
+        }
+        Ok(repo)
+    }
 
+    /// The repository `snapshot` describes. `offline`, a package file not
+    /// inspected before is left out rather than downloaded.
+    async fn assemble(&self, pubkey: &str, d: &str, snapshot: &nip82::Snapshot, offline: bool) -> BuildResult {
+        let started = Instant::now();
         let mut rejections = Vec::new();
         let mut wanted = Vec::new();
         let mut releases = Vec::new();
@@ -282,7 +317,7 @@ impl Repos {
 
         let inspected: Vec<_> = futures_util::stream::iter(wanted)
             .map(|(release, channel, asset, format)| async move {
-                let result = self.inspected(&asset, format).await;
+                let result = self.inspected(&asset, format, offline).await;
                 (release, channel, asset, result)
             })
             .buffer_unordered(DOWNLOADS)
@@ -376,6 +411,7 @@ impl Repos {
             packages = repo.packages.len(),
             rejected = repo.rejections.len(),
             ms = started.elapsed().as_millis() as u64,
+            offline,
             "built"
         );
         Ok(Arc::new(repo))
@@ -385,10 +421,12 @@ impl Repos {
     /// downloading and reading it. Errors are what might go differently next
     /// time, such as a server being down; what the file itself is wrong about
     /// is in the result, and stored.
-    async fn inspected(&self, asset: &Asset, format: Format) -> anyhow::Result<Inspected> {
+    async fn inspected(&self, asset: &Asset, format: Format, offline: bool) -> anyhow::Result<Inspected> {
         if let Some(inspected) = self.db.inspected(&asset.sha256).await? {
             return Ok(inspected);
         }
+        // Only a file whose download failed last time gets here.
+        anyhow::ensure!(!offline, "The file isn't downloaded yet. It will be tried again when the repository is next refreshed.");
 
         let mut urls: Vec<String> = asset.url.iter().filter(|url| url.starts_with("https://")).cloned().collect();
         urls.extend(self.config.blossom.iter().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256)));
@@ -584,5 +622,75 @@ mod tests {
         assert_eq!(db.pin("pk", "app", Format::Deb, "x 2 amd64", &second).await.unwrap(), second);
         assert_eq!(db.pin("pk", "app", Format::Rpm, "x 1 amd64", &second).await.unwrap(), second);
         assert_eq!(db.pin("pk", "other", Format::Deb, "x 1 amd64", &second).await.unwrap(), second);
+    }
+
+    /// A database as a gateway that built `hello` once leaves it: the
+    /// fixture .deb inspected, and the relays' answer stored.
+    async fn stored_hello(db: &Db) {
+        let bytes = include_bytes!("../tests/fixtures/hello_1.2.0-rc.1_amd64.deb");
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        let url = "https://example.com/hello.deb".to_string();
+        let meta = inspect::inspect(Format::Deb, bytes).unwrap();
+        db.store_inspected(&sha256, &Inspected { size: bytes.len() as u64, url: url.clone(), meta: Ok(meta) }).await.unwrap();
+        let asset = Asset {
+            mime: nip82::DEB_MIME.into(),
+            sha256,
+            url: Some(url),
+            filename: Some("hello.deb".into()),
+            size: Some(bytes.len() as u64),
+            platforms: vec!["linux-x86_64".into()],
+        };
+        let snapshot = nip82::Snapshot {
+            application: Some(nip82::Application { name: Some("Hello".into()), summary: None }),
+            releases: vec![nip82::Release {
+                version: "1.2.0-rc.1".into(),
+                channel: "main".into(),
+                created_at: 1_700_000_000,
+                notes: String::new(),
+                assets: vec![asset],
+            }],
+        };
+        db.store_snapshot("pk", "hello", &snapshot).await.unwrap();
+    }
+
+    /// Repositories whose relays never answer.
+    fn offline_repos(dir: &std::path::Path, db: &Db, ttl: Duration) -> Arc<Repos> {
+        let key = dir.join(format!("key-{}.asc", ttl.as_secs()));
+        let signer = Arc::new(Signer::generate(&key, "test").unwrap());
+        Repos::new(Config { relays: vec!["ws://127.0.0.1:9".into()], blossom: Vec::new(), ttl }, db.clone(), signer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn builds_from_a_stored_snapshot_without_relays() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        stored_hello(&db).await;
+
+        let repo = offline_repos(dir.path(), &db, Duration::from_secs(300)).get("pk", "hello").await.unwrap();
+        assert_eq!(repo.name, "Hello");
+        assert_eq!(repo.packages.len(), 1);
+        assert!(repo.rejections.is_empty(), "{:?}", repo.rejections);
+        let packages = repo.apt_file("stable", "main/binary-amd64/Packages").unwrap();
+        assert!(std::str::from_utf8(packages).unwrap().contains("Package: hello"));
+
+        // Another process, from the same database, serves the same index.
+        let again = offline_repos(dir.path(), &db, Duration::from_secs(301)).get("pk", "hello").await.unwrap();
+        assert_eq!(again.apt_file("stable", "Release"), repo.apt_file("stable", "Release"));
+    }
+
+    #[tokio::test]
+    async fn keeps_a_stale_stored_repository_while_relays_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        stored_hello(&db).await;
+        let repos = offline_repos(dir.path(), &db, Duration::ZERO);
+
+        assert_eq!(repos.get("pk", "hello").await.unwrap().packages.len(), 1);
+        let slot = repos.slots.lock().unwrap()[&("pk".to_string(), "hello".to_string())].clone();
+        while slot.refreshing.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(repos.get("pk", "hello").await.unwrap().packages.len(), 1);
+        assert!(db.snapshot("pk", "hello").await.unwrap().is_some());
     }
 }

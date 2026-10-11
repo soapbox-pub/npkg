@@ -1,6 +1,7 @@
 //! SQLite: what each package file was found to be, which file each package
-//! version is pinned to, and the key each NIP-05 address last named.
-//! Everything else is rebuilt from relays.
+//! version is pinned to, the key each NIP-05 address last named, and what
+//! relays last said about each application. With those, a repository is
+//! rebuilt after a restart without the network.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::inspect::{Format, Meta};
+use crate::nip82::Snapshot;
 
 #[derive(Clone)]
 pub struct Db {
@@ -53,6 +55,13 @@ impl Db {
                pubkey TEXT NOT NULL,
                resolved_at INTEGER NOT NULL,
                PRIMARY KEY (name, domain)
+             );
+             CREATE TABLE IF NOT EXISTS snapshots (
+               pubkey TEXT NOT NULL,
+               d TEXT NOT NULL,
+               fetched_at INTEGER NOT NULL,
+               snapshot TEXT NOT NULL,
+               PRIMARY KEY (pubkey, d)
              );",
         )?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
@@ -141,7 +150,7 @@ impl Db {
                 .optional()
             })
             .await?;
-        Ok(row.map(|(pubkey, resolved_at)| (pubkey, Duration::from_secs(unix_now().saturating_sub(resolved_at).max(0) as u64))))
+        Ok(row.map(|(pubkey, resolved_at)| (pubkey, age(resolved_at))))
     }
 
     pub async fn store_nip05(&self, name: &str, domain: &str, pubkey: &str) -> anyhow::Result<()> {
@@ -162,8 +171,41 @@ impl Db {
         self.call(move |conn| conn.execute("DELETE FROM nip05 WHERE name = ? AND domain = ?", [name, domain])).await?;
         Ok(())
     }
+
+    /// What relays last said about `pubkey`'s application `d`, and how long
+    /// ago. One stored by an older gateway that no longer reads is an error.
+    pub async fn snapshot(&self, pubkey: &str, d: &str) -> anyhow::Result<Option<(Snapshot, Duration)>> {
+        let (pubkey, d) = (pubkey.to_string(), d.to_string());
+        let row = self
+            .call(move |conn| {
+                conn.query_row("SELECT snapshot, fetched_at FROM snapshots WHERE pubkey = ? AND d = ?", [pubkey, d], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()
+            })
+            .await?;
+        row.map(|(snapshot, fetched_at)| Ok((serde_json::from_str(&snapshot)?, age(fetched_at)))).transpose()
+    }
+
+    pub async fn store_snapshot(&self, pubkey: &str, d: &str, snapshot: &Snapshot) -> anyhow::Result<()> {
+        let args = [pubkey.to_string(), d.to_string(), serde_json::to_string(snapshot)?];
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO snapshots (pubkey, d, fetched_at, snapshot) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (pubkey, d) DO UPDATE SET fetched_at = excluded.fetched_at, snapshot = excluded.snapshot",
+                params![args[0], args[1], unix_now(), args[2]],
+            )
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
+}
+
+/// How long ago a stored Unix time was.
+fn age(then: i64) -> Duration {
+    Duration::from_secs(unix_now().saturating_sub(then).max(0) as u64)
 }
