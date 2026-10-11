@@ -2,6 +2,7 @@
 //! assets (kind 3063): what one application's author has published, fetched
 //! from relays.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ pub struct Release {
     pub version: String,
     pub channel: String,
     pub created_at: i64,
+    pub notes: String,
+    /// In the order the release lists them.
     pub assets: Vec<Asset>,
 }
 
@@ -41,6 +44,21 @@ pub struct Asset {
     pub mime: String,
     pub sha256: String,
     pub url: Option<String>,
+    pub filename: Option<String>,
+    pub size: Option<u64>,
+    /// The `f` tags: `linux-x86_64`, `android-arm64-v8a`, and so on.
+    pub platforms: Vec<String>,
+}
+
+impl Asset {
+    /// What the asset is called in a download URL: its `filename`, or its
+    /// sha256 when it has none that fits in one path segment.
+    pub fn name(&self) -> &str {
+        match &self.filename {
+            Some(name) if !name.is_empty() && name != "." && name != ".." && !name.chars().any(|c| c.is_control() || c == '/') => name,
+            _ => &self.sha256,
+        }
+    }
 }
 
 /// Everything one application's author has published about it.
@@ -112,6 +130,7 @@ pub async fn fetch(relays: &[String], pubkey: &str, d: &str) -> anyhow::Result<S
             version: event.tag("version").unwrap_or_default().to_string(),
             channel: event.tag("c").unwrap_or("main").to_string(),
             created_at: event.created_at,
+            notes: event.content.clone(),
             assets: tag_values(event, "e").filter_map(|id| assets.get(id).cloned()).collect(),
         })
         .collect();
@@ -124,7 +143,89 @@ fn parse_asset(event: &Event) -> Option<Asset> {
     if !is_hex64(&sha256) {
         return None;
     }
-    Some(Asset { mime: event.tag("m")?.to_ascii_lowercase(), sha256, url: event.tag("url").map(str::to_string) })
+    Some(Asset {
+        mime: event.tag("m")?.to_ascii_lowercase(),
+        sha256,
+        url: event.tag("url").map(str::to_string),
+        filename: event.tag("filename").map(str::to_string),
+        size: event.tag("size").and_then(|size| size.parse().ok()),
+        platforms: tag_values(event, "f").map(str::to_string).collect(),
+    })
+}
+
+/// How two release versions order, semver's way where they look like
+/// semver: an optional `v`, dotted numbers, then an optional `-prerelease`
+/// that sorts below the release itself, and a `+build` that's ignored.
+/// Missing numbers count as 0, so `1.2` is `1.2.0`. A version that isn't
+/// like that sorts below every one that is, and equal to every other one.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    match (parse_version(a), parse_version(b)) {
+        (Some(a), Some(b)) => {
+            let parts = a.0.len().max(b.0.len());
+            let core = (0..parts)
+                .map(|i| compare_numbers(a.0.get(i).copied().unwrap_or("0"), b.0.get(i).copied().unwrap_or("0")))
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(Ordering::Equal);
+            core.then_with(|| match (a.1, b.1) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(a), Some(b)) => compare_prereleases(a, b),
+            })
+        }
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Whether a version has a `-prerelease` part, like `1.2.0-rc.1`.
+pub fn is_prerelease(version: &str) -> bool {
+    parse_version(version).is_some_and(|(_, prerelease)| prerelease.is_some())
+}
+
+/// A version's dotted numbers and its prerelease part.
+fn parse_version(version: &str) -> Option<(Vec<&str>, Option<&str>)> {
+    let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let version = version.split_once('+').map_or(version, |(version, _)| version);
+    let (core, prerelease) = match version.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (version, None),
+    };
+    let core: Vec<&str> = core.split('.').collect();
+    if core.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    Some((core, prerelease.filter(|prerelease| !prerelease.is_empty())))
+}
+
+/// Two strings of digits, as numbers of any size.
+fn compare_numbers(a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Semver's precedence for prereleases: numeric identifiers as numbers and
+/// below alphanumeric ones, and more identifiers above fewer.
+fn compare_prereleases(a: &str, b: &str) -> Ordering {
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let (mut a, mut b) = (a.split('.'), b.split('.'));
+    loop {
+        let ordering = match (a.next(), b.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) => match (numeric(a), numeric(b)) {
+                (true, true) => compare_numbers(a, b),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => a.cmp(b),
+            },
+        };
+        if ordering.is_ne() {
+            return ordering;
+        }
+    }
 }
 
 fn tag_values<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a str> {
@@ -133,4 +234,60 @@ fn tag_values<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a s
 
 fn has_tag(event: &Event, name: &str, value: &str) -> bool {
     tag_values(event, name).any(|v| v == value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orders_versions_like_semver() {
+        let ordered = [
+            "nightly",
+            "0.9",
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "v1.0.0",
+            "1.2",
+            "1.9.0",
+            "1.10.0",
+            "10.0.0",
+        ];
+        for pair in ordered.windows(2) {
+            assert_eq!(compare_versions(pair[0], pair[1]), Ordering::Less, "{} < {}", pair[0], pair[1]);
+            assert_eq!(compare_versions(pair[1], pair[0]), Ordering::Greater, "{} > {}", pair[1], pair[0]);
+        }
+        assert_eq!(compare_versions("1.0", "v1.0.0+build.5"), Ordering::Equal);
+        assert_eq!(compare_versions("nightly", "git-3f2a1c"), Ordering::Equal);
+        assert_eq!(compare_versions("99999999999999999999999.0", "99999999999999999999998.1"), Ordering::Greater);
+    }
+
+    #[test]
+    fn tells_prereleases() {
+        assert!(is_prerelease("1.2.0-rc.1"));
+        assert!(is_prerelease("v2-beta"));
+        assert!(!is_prerelease("1.2.0"));
+        assert!(!is_prerelease("1.2.0+build-5"));
+        assert!(!is_prerelease("nightly-2026"));
+    }
+
+    #[test]
+    fn names_assets_by_filename_or_hash() {
+        let asset = |filename: Option<&str>| Asset {
+            mime: "application/zip".into(),
+            sha256: "a".repeat(64),
+            url: None,
+            filename: filename.map(str::to_string),
+            size: None,
+            platforms: Vec::new(),
+        };
+        assert_eq!(asset(Some("Armada-v1.zip")).name(), "Armada-v1.zip");
+        assert_eq!(asset(None).name(), "a".repeat(64));
+        assert_eq!(asset(Some("../x")).name(), "a".repeat(64));
+        assert_eq!(asset(Some("")).name(), "a".repeat(64));
+    }
 }

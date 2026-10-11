@@ -19,10 +19,13 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 
+use serde_json::{Value, json};
+
 use crate::inspect::Format;
 use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
-use crate::repo::{BuildError, CHANNELS, Repo, Repos, channel_rank};
+use crate::repo::{BuildError, CHANNELS, Release, Repo, Repos, channel_rank};
+use crate::{apt, nip82};
 
 pub struct AppState {
     pub repos: Arc<Repos>,
@@ -47,6 +50,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/rpm/{owner}/{d}/repo", get(rpm_repo))
         .route("/rpm/{owner}/{d}/{channel}/repodata/{file}", get(rpm_repodata))
         .route("/rpm/{owner}/{d}/{channel}/packages/{sha256}/{file}", get(rpm_package))
+        .route("/releases/{owner}/{d}", get(releases))
+        .route("/releases/{owner}/{d}/latest", get(latest_release))
+        .route("/releases/{owner}/{d}/latest/download/{name}", get(latest_download))
+        .route("/releases/{owner}/{d}/tags/{version}", get(tagged_release))
+        .route("/releases/{owner}/{d}/download/{version}/{name}", get(tagged_download))
         .with_state(state)
 }
 
@@ -57,6 +65,10 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn text(content_type: &'static str, body: impl Into<Vec<u8>>) -> Response {
     ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=60")], body.into()).into_response()
+}
+
+fn json(value: &Value) -> Response {
+    text("application/json", serde_json::to_string_pretty(value).unwrap_or_default() + "\n")
 }
 
 /// The hex pubkey an npub or a NIP-05 address names, and the owner as the
@@ -109,6 +121,8 @@ async fn index(State(state): Shared) -> Response {
             "npkg-gateway: apt and dnf repositories for software released on Nostr (NIP-82).\n\n\
              apt:  {0}/apt/<owner>/<app-id>\n\
              dnf:  {0}/rpm/<owner>/<app-id>\n\
+             releases, as JSON:  {0}/releases/<owner>/<app-id>, and /latest\n\
+             a release's file:   {0}/releases/<owner>/<app-id>/latest/download/<filename>\n\
              The owner is an npub, or a NIP-05 address: alex@gleasonator.com, or soapbox.pub for _@soapbox.pub.\n\n\
              key:  {0}/key.asc ({1})\n",
             state.public_url,
@@ -159,6 +173,11 @@ async fn status(State(state): Shared, Path((owner, d)): Path<(String, String)>) 
     }
     let _ = writeln!(out, "Channels: {} (add ?channel=beta to either setup URL)", CHANNELS.join(", "));
     let _ = writeln!(out, "This repository serves whatever packages its author publishes, under any name.\n");
+    let _ = writeln!(
+        out,
+        "Releases, as JSON: {base}/releases/{owner}/{d}\nThe latest release's files: {base}/releases/{owner}/{d}/latest/download/<filename>\n",
+        d = segment(&repo.d)
+    );
 
     let _ = writeln!(out, "Packages:");
     if repo.packages.is_empty() {
@@ -333,6 +352,146 @@ async fn download(state: &AppState, owner: &str, d: &str, format: Format, sha256
     match repo.download_url(format, sha256) {
         Some(url) => Redirect::to(url).into_response(),
         None => error(StatusCode::NOT_FOUND, "This repository has no such package."),
+    }
+}
+
+/// Where a repository's releases are listed: no trailing slash.
+fn releases_url(state: &AppState, owner: &str, repo: &Repo) -> String {
+    format!("{}/releases/{owner}/{}", state.public_url, segment(&repo.d))
+}
+
+/// A release, shaped after GitHub's release JSON but with less in it.
+fn release_json(base: &str, release: &Release) -> Value {
+    let assets: Vec<Value> = release
+        .assets
+        .iter()
+        .map(|asset| {
+            json!({
+                "name": asset.name(),
+                "size": asset.size,
+                "content_type": asset.mime,
+                "sha256": asset.sha256,
+                "platforms": asset.platforms,
+                "download_url": format!("{base}/download/{}/{}", segment(&release.version), segment(asset.name())),
+            })
+        })
+        .collect();
+    json!({
+        "version": release.version,
+        "channel": CHANNELS[release.channel],
+        "prerelease": release.channel > 0 || nip82::is_prerelease(&release.version),
+        "published_at": apt::rfc3339(release.created_at),
+        "notes": release.notes,
+        "assets": assets,
+    })
+}
+
+/// Every release, highest version first.
+async fn releases(State(state): Shared, Path((owner, d)): Path<(String, String)>) -> Response {
+    let (repo, owner) = match repo(&state, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let base = releases_url(&state, &owner, &repo);
+    json(&Value::Array(repo.releases.iter().map(|release| release_json(&base, release)).collect()))
+}
+
+/// The latest release on `?channel=`, or the stable one.
+async fn latest_release(
+    State(state): Shared,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    match latest(&state, &owner, &d, &query).await {
+        Ok((repo, owner, release)) => json(&release_json(&releases_url(&state, &owner, &repo), &release)),
+        Err(response) => response,
+    }
+}
+
+async fn latest_download(
+    State(state): Shared,
+    Path((owner, d, name)): Path<(String, String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    match latest(&state, &owner, &d, &query).await {
+        Ok((repo, owner, release)) => asset_redirect(&releases_url(&state, &owner, &repo), &release, &name),
+        Err(response) => response,
+    }
+}
+
+async fn tagged_release(State(state): Shared, Path((owner, d, version)): Path<(String, String, String)>) -> Response {
+    match tagged(&state, &owner, &d, &version).await {
+        Ok((repo, owner, release)) => json(&release_json(&releases_url(&state, &owner, &repo), &release)),
+        Err(response) => response,
+    }
+}
+
+async fn tagged_download(State(state): Shared, Path((owner, d, version, name)): Path<(String, String, String, String)>) -> Response {
+    match tagged(&state, &owner, &d, &version).await {
+        Ok((repo, owner, release)) => asset_redirect(&releases_url(&state, &owner, &repo), &release, &name),
+        Err(response) => response,
+    }
+}
+
+/// The repository, its owner, and its latest release on `?channel=`.
+async fn latest(state: &AppState, owner: &str, d: &str, query: &HashMap<String, String>) -> Result<(Arc<Repo>, String, Release), Response> {
+    let channel = setup_channel(query)?;
+    let (repo, owner) = repo(state, owner, d).await?;
+    let rank = channel_rank(channel).unwrap_or(0);
+    let Some(release) = repo.latest(rank) else {
+        let wider = if rank + 1 < CHANNELS.len() {
+            format!(" Add ?channel={} to look at less stable ones.", CHANNELS[rank + 1])
+        } else {
+            String::new()
+        };
+        return Err(error(StatusCode::NOT_FOUND, format!("{} has no release on the {channel} channel.{wider}", repo.name)));
+    };
+    let release = release.clone();
+    Ok((repo, owner, release))
+}
+
+/// The repository, its owner, and its release `version`.
+async fn tagged(state: &AppState, owner: &str, d: &str, version: &str) -> Result<(Arc<Repo>, String, Release), Response> {
+    let (repo, owner) = repo(state, owner, d).await?;
+    let Some(release) = repo.release(version).cloned() else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("{} has no release {version:?}. Its releases are listed at {}.", repo.name, releases_url(state, &owner, &repo)),
+        ));
+    };
+    Ok((repo, owner, release))
+}
+
+/// A redirect to the release's file called `name`, or with that sha256.
+/// The gateway doesn't download these files, so it hasn't checked them:
+/// whoever downloads one should check it against the sha256 in the JSON.
+fn asset_redirect(base: &str, release: &Release, name: &str) -> Response {
+    let matching: Vec<&nip82::Asset> = release.assets.iter().filter(|asset| asset.name() == name || asset.sha256 == name).collect();
+    let mut hashes: Vec<&str> = matching.iter().map(|asset| asset.sha256.as_str()).collect();
+    hashes.sort();
+    hashes.dedup();
+    let listing = format!("{base}/tags/{}", segment(&release.version));
+    match (matching.first(), hashes.len()) {
+        (None, _) => error(
+            StatusCode::NOT_FOUND,
+            format!("Release {} has no file named {name:?}. Its files are listed at {listing}.", release.version),
+        ),
+        (Some(_), 2..) => error(
+            StatusCode::CONFLICT,
+            format!(
+                "Release {} has more than one file named {name:?}: {}. Download one by its sha256 instead, from {base}/download/{}/<sha256>.",
+                release.version,
+                hashes.join(", "),
+                segment(&release.version)
+            ),
+        ),
+        (Some(asset), _) => match &asset.url {
+            Some(url) => Redirect::to(url).into_response(),
+            None => error(
+                StatusCode::NOT_FOUND,
+                format!("{name:?} has no https URL, and the gateway has no Blossom server configured to look for it on."),
+            ),
+        },
     }
 }
 

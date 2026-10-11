@@ -94,6 +94,25 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
 pub fn rfc2822(time: i64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (year, month, day, seconds) = civil(time);
+    format!(
+        "{}, {day:02} {} {year} {:02}:{:02}:{:02} UTC",
+        DAYS[time.div_euclid(86_400).rem_euclid(7) as usize],
+        MONTHS[(month - 1) as usize],
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// A Unix time as RFC 3339 has it, in UTC.
+pub fn rfc3339(time: i64) -> String {
+    let (year, month, day, seconds) = civil(time);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", seconds / 3600, seconds / 60 % 60, seconds % 60)
+}
+
+/// The year, month, day, and second of the day of a Unix time, in UTC.
+fn civil(time: i64) -> (i64, i64, i64, i64) {
     let days = time.div_euclid(86_400);
     let seconds = time.rem_euclid(86_400);
     // Howard Hinnant's civil_from_days.
@@ -106,14 +125,7 @@ pub fn rfc2822(time: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{}, {day:02} {} {year} {:02}:{:02}:{:02} UTC",
-        DAYS[days.rem_euclid(7) as usize],
-        MONTHS[(month - 1) as usize],
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    )
+    (year, month, day, seconds)
 }
 
 #[cfg(test)]
@@ -136,5 +148,7 @@ mod tests {
         assert_eq!(rfc2822(0), "Thu, 01 Jan 1970 00:00:00 UTC");
         assert_eq!(rfc2822(1_791_497_344), "Thu, 08 Oct 2026 22:09:04 UTC");
         assert_eq!(rfc2822(951_782_400), "Tue, 29 Feb 2000 00:00:00 UTC");
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_791_497_344), "2026-10-08T22:09:04Z");
     }
 }

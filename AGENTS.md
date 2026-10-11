@@ -14,7 +14,8 @@ This is a spike: kept simple on purpose, and revised as we go.
 src/
   main.rs        the CLI: keygen, serve
   config.rs      the TOML config file (npkg-gateway.example.toml)
-  http.rs        the routes, setup files, and the status page
+  http.rs        the routes, setup files, the status page, and release JSON
+                 and downloads (/releases/<owner>/<d>)
   repo.rs        building a repository: fetch, inspect, select, pin, render;
                  cached in memory and rebuilt in the background
   nip82.rs       application, release and asset events, fetched from relays

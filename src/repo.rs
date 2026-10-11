@@ -83,6 +83,20 @@ pub struct Rejection {
     pub reason: String,
 }
 
+/// A NIP-82 release, as the gateway lists it for downloading its files
+/// directly.
+#[derive(Clone, Debug)]
+pub struct Release {
+    pub version: String,
+    /// A rank in [`CHANNELS`].
+    pub channel: usize,
+    pub created_at: i64,
+    pub notes: String,
+    /// Every asset, whatever its type. Each `url` is where a download
+    /// redirects to: the asset's own https URL, or else a Blossom server's.
+    pub assets: Vec<Asset>,
+}
+
 pub struct Repo {
     pub pubkey: String,
     pub d: String,
@@ -90,6 +104,8 @@ pub struct Repo {
     pub summary: Option<String>,
     pub packages: Vec<Package>,
     pub rejections: Vec<Rejection>,
+    /// Highest version first.
+    pub releases: Vec<Release>,
     /// By suite, then by path below `dists/<suite>/`.
     apt: HashMap<String, HashMap<String, Vec<u8>>>,
     /// By channel, then by path below it.
@@ -110,6 +126,27 @@ impl Repo {
     pub fn download_url(&self, format: Format, sha256: &str) -> Option<&str> {
         self.packages.iter().find(|package| package.sha256 == sha256 && package.meta.format() == format).map(|package| package.url.as_str())
     }
+
+    /// The release with this version.
+    pub fn release(&self, version: &str) -> Option<&Release> {
+        self.releases.iter().find(|release| release.version == version)
+    }
+
+    /// The highest version on the channel ranked `rank` or a more stable
+    /// one. On the stable channel a prerelease version, like `1.2.0-rc.1`,
+    /// isn't the latest even when its author tags it `main`.
+    pub fn latest(&self, rank: usize) -> Option<&Release> {
+        latest(&self.releases, rank)
+    }
+}
+
+fn latest(releases: &[Release], rank: usize) -> Option<&Release> {
+    releases.iter().find(|release| release.channel <= rank && (rank > 0 || !nip82::is_prerelease(&release.version)))
+}
+
+/// `releases`, highest version first, and the newest first of equal ones.
+fn sort_releases(releases: &mut [Release]) {
+    releases.sort_by(|a, b| nip82::compare_versions(&b.version, &a.version).then_with(|| b.created_at.cmp(&a.created_at)));
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +239,7 @@ impl Repos {
 
         let mut rejections = Vec::new();
         let mut wanted = Vec::new();
+        let mut releases = Vec::new();
         for release in &snapshot.releases {
             let Some(channel) = RELEASE_CHANNELS.iter().position(|channel| *channel == release.channel) else {
                 rejections.push(Rejection {
@@ -220,7 +258,26 @@ impl Repos {
                     wanted.push((release.clone(), channel, asset.clone(), format));
                 }
             }
+            let assets =
+                release
+                    .assets
+                    .iter()
+                    .map(|asset| Asset {
+                        url: asset.url.clone().filter(|url| url.starts_with("https://")).or_else(|| {
+                            self.config.blossom.first().map(|server| format!("{}/{}", server.trim_end_matches('/'), asset.sha256))
+                        }),
+                        ..asset.clone()
+                    })
+                    .collect();
+            releases.push(Release {
+                version: release.version.clone(),
+                channel,
+                created_at: release.created_at,
+                notes: release.notes.clone(),
+                assets,
+            });
         }
+        sort_releases(&mut releases);
         wanted.truncate(MAX_CANDIDATES);
 
         let inspected: Vec<_> = futures_util::stream::iter(wanted)
@@ -307,7 +364,7 @@ impl Repos {
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
             }
-            Ok(Repo { pubkey, d, name, summary, packages, rejections, apt, rpm })
+            Ok(Repo { pubkey, d, name, summary, packages, rejections, releases, apt, rpm })
         })
         .await
         .map_err(|error| BuildError::Failed(error.to_string()))?
@@ -488,6 +545,31 @@ mod tests {
         assert_eq!(package_key(&Meta::Rpm(Box::new(meta))), "hello 0:1.2.0~rc.1-1 x86_64");
         let deb = parse_control("Package: hello\nVersion: 1:1.2-3\nArchitecture: arm64\n").unwrap();
         assert_eq!(package_key(&Meta::Deb(deb)), "hello 1:1.2-3 arm64");
+    }
+
+    #[test]
+    fn picks_the_latest_release_by_version_and_channel() {
+        let release = |version: &str, channel, created_at| Release {
+            version: version.into(),
+            channel,
+            created_at,
+            notes: String::new(),
+            assets: Vec::new(),
+        };
+        let mut releases = vec![
+            release("1.9.0", 0, 30),
+            release("1.10.0", 0, 10),
+            release("1.11.0-rc.1", 0, 40),
+            release("2.0.0-beta.1", 1, 50),
+            release("1.10.0", 2, 5),
+        ];
+        sort_releases(&mut releases);
+        let versions: Vec<_> = releases.iter().map(|release| release.version.as_str()).collect();
+        assert_eq!(versions, ["2.0.0-beta.1", "1.11.0-rc.1", "1.10.0", "1.10.0", "1.9.0"]);
+        // A republished old version doesn't win by being newer.
+        assert_eq!(latest(&releases, 0).map(|release| release.version.as_str()), Some("1.10.0"));
+        assert_eq!(latest(&releases, 1).map(|release| release.version.as_str()), Some("2.0.0-beta.1"));
+        assert!(latest(&releases[..2], 0).is_none());
     }
 
     #[tokio::test]

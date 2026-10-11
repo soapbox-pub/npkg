@@ -33,6 +33,58 @@ sudo dnf install npanel
 Add `?channel=beta` (or `nightly`, `dev`) to a setup URL to follow a
 less stable channel.
 
+## Release files
+
+Every file an application's releases list, of any type, can also be
+downloaded directly, the way GitHub's release URLs work, so a script can
+fetch the latest build:
+
+```sh
+B=https://<host>/releases/<owner>/<d>
+curl -fsSLO $B/latest/download/myapp-linux-x86_64.tar.gz   # latest stable
+curl -fsSLO $B/download/1.2.0/myapp-linux-x86_64.tar.gz    # one release
+
+# When file names have the version in them, pick one from the JSON:
+B=https://<host>/releases/soapbox.pub/buzz.armada.app
+curl -fsSL $B/latest | jq -r '.assets[] | select(.platforms | index("linux-x86_64"))
+  | select(.content_type == "application/vnd.appimage") | .download_url'
+```
+
+| Path | |
+|---|---|
+| `/releases/<owner>/<d>` | every release as JSON, highest version first |
+| `/releases/<owner>/<d>/latest` | the latest release |
+| `/releases/<owner>/<d>/tags/<version>` | one release |
+| `/releases/<owner>/<d>/latest/download/<name>` | a redirect to the latest release's file |
+| `/releases/<owner>/<d>/download/<version>/<name>` | a redirect to a release's file |
+
+A file's name is its asset's `filename` tag, or its sha256 if it has none;
+either one works in a download URL. A release looks like this:
+
+```json
+{
+  "version": "0.64.11",
+  "channel": "stable",
+  "prerelease": false,
+  "published_at": "2026-10-10T03:27:34Z",
+  "notes": "…",
+  "assets": [{
+    "name": "Armada-v0.64.11.apk",
+    "size": 10327052,
+    "content_type": "application/vnd.android.package-archive",
+    "sha256": "bb745014…",
+    "platforms": ["android-arm64-v8a", "android-armeabi-v7a"],
+    "download_url": "https://<host>/releases/…/download/0.64.11/Armada-v0.64.11.apk"
+  }]
+}
+```
+
+The latest release is the highest version, compared the way semver does,
+on the stable channel. A prerelease version like `1.2.0-rc.1` isn't the
+latest there even if its author tagged it `main`. Add `?channel=beta` (or
+`nightly`, `dev`) to `latest` to include less stable releases and
+prereleases.
+
 ## What a repository serves
 
 Every `.deb` and `.rpm` its application's releases list, under whatever
@@ -66,6 +118,12 @@ much as any third-party repository: the author can publish any package,
 under any name. Package downloads are redirects to Blossom: apt and dnf
 check each file against the hash in the signed index, so the server a file
 comes from doesn't need to be trusted.
+
+Release files are different. The gateway doesn't download them, and
+nothing checks them on the way down: a download is a redirect to the URL
+the author's asset gives, or to a Blossom server by its hash. Check the
+file against the `sha256` in the release's JSON, which comes from the
+author's signed event.
 
 A repository added by NIP-05 address follows the address: the gateway looks
 it up again every few minutes, so whoever controls the domain decides whose
