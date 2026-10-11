@@ -1,9 +1,10 @@
 # npkg-gateway
 
 apt and dnf repositories for software released on Nostr (NIP-82). Each
-application's repository, at `/apt/<npub>/<d>` and `/rpm/<npub>/<d>`, serves
-every package its releases list, under any name. See README.md for what's
-left out.
+application's repository, at `/apt/<owner>/<d>` and `/rpm/<owner>/<d>`, serves
+every package its releases list, under any name. The owner is an npub or a
+NIP-05 address (`alex@gleasonator.com`, or `soapbox.pub` for `_@soapbox.pub`).
+See README.md for what's left out.
 
 This is a spike: kept simple on purpose, and revised as we go.
 
@@ -16,7 +17,8 @@ src/
   repo.rs        building a repository: fetch, inspect, select, pin, render;
                  cached in memory and rebuilt in the background
   nip82.rs       application, release and asset events, fetched from relays
-  nostr/         events, NIP-19 (both from npanel), one-shot relay queries
+  nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (cached),
+                 one-shot relay queries
   inspect/       reading a .deb's control file and an .rpm's header
   apt.rs         dists/<suite>/: Release, InRelease, Packages; the arches
   rpmmd.rs       repodata/: primary, filelists, other, repomd.xml

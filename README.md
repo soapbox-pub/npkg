@@ -7,9 +7,13 @@ that publishes `.deb` or `.rpm` assets gets its own repository, addressed by
 its author and its `d` tag:
 
 ```
-/apt/<npub>/<d>     # Debian, Ubuntu
-/rpm/<npub>/<d>     # Fedora, RHEL, Rocky
+/apt/<owner>/<d>     # Debian, Ubuntu
+/rpm/<owner>/<d>     # Fedora, RHEL, Rocky
 ```
+
+The owner is the author's npub, or a NIP-05 address that names them:
+`alex@gleasonator.com`, or a bare domain like `soapbox.pub` for
+`_@soapbox.pub`. Setup files keep whichever form they were asked for by.
 
 Opening either path shows the repository's packages, the files it left out
 and why, and how to add it:
@@ -62,6 +66,13 @@ much as any third-party repository: the author can publish any package,
 under any name. Package downloads are redirects to Blossom: apt and dnf
 check each file against the hash in the signed index, so the server a file
 comes from doesn't need to be trusted.
+
+A repository added by NIP-05 address follows the address: the gateway looks
+it up again every few minutes, so whoever controls the domain decides whose
+packages its users get. Add it by npub to pin the author instead. The lookup
+only goes to public-looking domain names (no IP addresses, ports, or
+single-label hosts), but the gateway doesn't check where those resolve to:
+run it where it can't reach anything private.
 
 ## Running it
 

@@ -1,8 +1,8 @@
 //! npkg-gateway: apt and dnf repositories for software released on Nostr.
 //!
-//! Each NIP-82 application is one package, served from its own repository at
-//! `/apt/<npub>/<d>` and `/rpm/<npub>/<d>`, built from the author's events and
-//! signed with the gateway's key.
+//! Each NIP-82 application gets its own repository at `/apt/<owner>/<d>` and
+//! `/rpm/<owner>/<d>`, where the owner is its author's npub or NIP-05
+//! address, built from the author's events and signed with the gateway's key.
 
 mod apt;
 mod db;
@@ -84,10 +84,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { listen, public_url, relays, blossom, ttl } => {
             let signer = Arc::new(signing::Signer::load(&key_path)?);
             let db = db::Db::open(&cli.data.join("npkg-gateway.sqlite"))?;
-            let config = repo::Config { relays, blossom, ttl: Duration::from_secs(ttl) };
+            let ttl = Duration::from_secs(ttl);
+            let config = repo::Config { relays, blossom, ttl };
             let repos = repo::Repos::new(config, db, signer)?;
+            let names = nostr::nip05::Resolver::new(ttl)?;
             let public_url = public_url.unwrap_or_else(|| format!("http://{listen}")).trim_end_matches('/').to_string();
-            let app = http::router(Arc::new(http::AppState { repos, public_url: public_url.clone() }));
+            let app = http::router(Arc::new(http::AppState { repos, names, public_url: public_url.clone() }));
 
             let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("Couldn't listen on {listen}."))?;
             tracing::info!(%listen, public_url, "listening");
