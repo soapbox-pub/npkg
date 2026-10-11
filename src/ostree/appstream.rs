@@ -30,6 +30,11 @@ use crate::gvariant::{Type, Value};
 /// The most an app's AppStream file or an icon may be, compressed or not.
 const MAX_FILE: u64 = 16 << 20;
 
+/// How deeply an app's AppStream elements may nest. Real ones go five or
+/// six deep; the tree is written, copied and dropped recursively, so a file
+/// made to nest millions deep would overflow the stack.
+const MAX_DEPTH: usize = 64;
+
 const ICON_SIZES: [&str; 2] = ["64x64", "128x128"];
 
 /// Make the AppStream branches for `apps`, writing their objects to
@@ -280,7 +285,10 @@ fn parse(xml: &str) -> Result<Vec<Element>> {
     };
     loop {
         match reader.read_event()? {
-            Event::Start(start) => open.push(element(&start)?),
+            Event::Start(start) => {
+                ensure!(open.len() < MAX_DEPTH, "Its elements nest more than {MAX_DEPTH} deep.");
+                open.push(element(&start)?);
+            }
             Event::Empty(start) => close(element(&start)?, &mut open, &mut roots),
             Event::End(_) => {
                 let element = open.pop().ok_or_else(|| anyhow!("An element closes that never opened."))?;
@@ -459,6 +467,8 @@ mod tests {
         assert_eq!(out, "<a x=\"1 &amp; 2\"><b/>tA&lt;&lt;raw&gt;<c>&apos;&quot;</c></a>");
         assert!(parse("<a><b></a>").is_err());
         assert!(parse("<a>&nbsp;</a>").is_err());
+        assert!(parse(&format!("{}{}", "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH))).is_ok());
+        assert!(parse(&"<a>".repeat(1_000_000)).is_err());
         let mut out = String::new();
         escape("\u{1}\u{85}\u{9f}é", &mut out);
         assert_eq!(out, "&#x1;\u{85}&#x9f;é");

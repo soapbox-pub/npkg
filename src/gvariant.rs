@@ -14,6 +14,11 @@ use std::fmt;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
+/// How deeply types and values may nest, variants included: GLib's own
+/// limit. Reading is recursive, and a bundle is the author's to make, so
+/// without one a few kilobytes of nesting would overflow the stack.
+const MAX_DEPTH: usize = 128;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     Bool,
@@ -37,12 +42,14 @@ pub enum Type {
 
 impl Type {
     pub fn parse(signature: &str) -> Result<Type> {
-        let (ty, rest) = Type::parse_one(signature.as_bytes()).with_context(|| format!("{signature:?} isn't a GVariant type"))?;
+        let (ty, rest) = Type::parse_one(signature.as_bytes(), 0).with_context(|| format!("{signature:?} isn't a GVariant type"))?;
         ensure!(rest.is_empty(), "{signature:?} is more than one GVariant type");
         Ok(ty)
     }
 
-    fn parse_one(s: &[u8]) -> Result<(Type, &[u8])> {
+    fn parse_one(s: &[u8], depth: usize) -> Result<(Type, &[u8])> {
+        ensure!(depth < MAX_DEPTH, "it nests more than {MAX_DEPTH} deep");
+        let depth = depth + 1;
         let (&first, rest) = s.split_first().ok_or_else(|| anyhow!("it ends early"))?;
         Ok(match first {
             b'b' => (Type::Bool, rest),
@@ -59,11 +66,11 @@ impl Type {
             b'g' => (Type::Signature, rest),
             b'v' => (Type::Variant, rest),
             b'm' => {
-                let (inner, rest) = Type::parse_one(rest)?;
+                let (inner, rest) = Type::parse_one(rest, depth)?;
                 (Type::Maybe(Box::new(inner)), rest)
             }
             b'a' => {
-                let (inner, rest) = Type::parse_one(rest)?;
+                let (inner, rest) = Type::parse_one(rest, depth)?;
                 (Type::Array(Box::new(inner)), rest)
             }
             b'(' => {
@@ -73,15 +80,15 @@ impl Type {
                     if let Some(after) = rest.strip_prefix(b")") {
                         break (Type::Tuple(members), after);
                     }
-                    let (member, after) = Type::parse_one(rest)?;
+                    let (member, after) = Type::parse_one(rest, depth)?;
                     members.push(member);
                     rest = after;
                 }
             }
             b'{' => {
-                let (key, rest) = Type::parse_one(rest)?;
+                let (key, rest) = Type::parse_one(rest, depth)?;
                 ensure!(key.fixed_size().is_some() || key.is_string(), "a dictionary key must be a basic type");
-                let (value, rest) = Type::parse_one(rest)?;
+                let (value, rest) = Type::parse_one(rest, depth)?;
                 let rest = rest.strip_prefix(b"}").ok_or_else(|| anyhow!("a dictionary entry has more than two members"))?;
                 (Type::Entry(Box::new(key), Box::new(value)), rest)
             }
@@ -315,6 +322,13 @@ impl<'a> Value<'a> {
     /// Read `data` as a value of type `ty`, borrowing strings and byte
     /// arrays from it.
     pub fn read(data: &'a [u8], ty: &Type) -> Result<Value<'a>> {
+        Value::read_at(data, ty, 0)
+    }
+
+    /// [`Self::read`], inside `depth` containers.
+    fn read_at(data: &'a [u8], ty: &Type, depth: usize) -> Result<Value<'a>> {
+        ensure!(depth < MAX_DEPTH, "a value nests more than {MAX_DEPTH} deep");
+        let depth = depth + 1;
         let scalar = |size: usize| -> Result<&'a [u8]> {
             ensure!(data.len() == size, "a {ty} is {size} bytes, not {}", data.len());
             Ok(data)
@@ -346,7 +360,7 @@ impl<'a> Value<'a> {
             Type::Variant => {
                 let nul = data.iter().rposition(|&b| b == 0).ok_or_else(|| anyhow!("a variant has no type"))?;
                 let inner_ty = Type::parse(std::str::from_utf8(&data[nul + 1..])?)?;
-                Value::Variant(Box::new(Value::read(&data[..nul], &inner_ty)?))
+                Value::Variant(Box::new(Value::read_at(&data[..nul], &inner_ty, depth)?))
             }
             Type::Maybe(inner) => {
                 if data.is_empty() {
@@ -360,7 +374,7 @@ impl<'a> Value<'a> {
                             body
                         }
                     };
-                    Value::Maybe((**inner).clone(), Some(Box::new(Value::read(body, inner)?)))
+                    Value::Maybe((**inner).clone(), Some(Box::new(Value::read_at(body, inner, depth)?)))
                 }
             }
             Type::Array(inner) if **inner == Type::Byte => Value::Bytes(Cow::Borrowed(data)),
@@ -370,7 +384,7 @@ impl<'a> Value<'a> {
                     Some(size) => {
                         ensure!(data.len().is_multiple_of(size), "an array of {inner} isn't a whole number of them");
                         for chunk in data.chunks(size) {
-                            items.push(Value::read(chunk, inner)?);
+                            items.push(Value::read_at(chunk, inner, depth)?);
                         }
                     }
                     None if data.is_empty() => {}
@@ -384,7 +398,7 @@ impl<'a> Value<'a> {
                             let end = read_offset(data, last_end + i * width, width)?;
                             start = align(start, inner.alignment());
                             ensure!(start <= end && end <= last_end, "an array's offsets are wrong");
-                            items.push(Value::read(&data[start..end], inner)?);
+                            items.push(Value::read_at(&data[start..end], inner, depth)?);
                             start = end;
                         }
                     }
@@ -418,7 +432,7 @@ impl<'a> Value<'a> {
                         }
                     };
                     ensure!(start <= end && end <= data.len(), "a tuple's offsets are wrong");
-                    values.push(Value::read(&data[start..end], member)?);
+                    values.push(Value::read_at(&data[start..end], member, depth)?);
                     start = end;
                 }
                 match ty {
@@ -623,5 +637,23 @@ mod tests {
         assert!(Type::parse("(s").is_err());
         assert!(Type::parse("{vs}").is_err());
         assert!(Type::parse("ss").is_err());
+    }
+
+    #[test]
+    fn refuses_deep_nesting() {
+        assert!(Type::parse(&format!("{}y", "a".repeat(100_000))).is_err());
+        assert!(Type::parse(&format!("{}y", "a".repeat(MAX_DEPTH - 1))).is_ok());
+        // A variant holding a variant holding a variant, and so on.
+        let mut nested = Value::Byte(1);
+        for _ in 0..MAX_DEPTH - 1 {
+            nested = Value::variant(nested);
+        }
+        assert!(Value::read(&nested.to_bytes(), &Type::Variant).is_ok());
+        let mut data = vec![1u8];
+        for _ in 0..100_000 {
+            data.extend_from_slice(b"\0v");
+        }
+        data[2] = b'y';
+        assert!(Value::read(&data, &Type::Variant).is_err());
     }
 }
