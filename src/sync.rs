@@ -46,6 +46,19 @@ const SETTLE: Duration = Duration::from_secs(3);
 const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const PRUNE_GRACE: Duration = Duration::from_secs(24 * 3600);
 
+/// How far ahead of the gateway's clock an event may be dated. One dated
+/// further would stand over every later release of its address, and an
+/// index dated in the future is one apt refuses, so a stolen key could
+/// otherwise break a repository for good. One refused now is picked up by
+/// a later resync, once its time has come.
+const MAX_FUTURE: i64 = 600;
+
+/// Whether `event` is dated no later than [`MAX_FUTURE`] from now.
+fn not_future(event: &Event) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
+    event.created_at <= now + MAX_FUTURE
+}
+
 pub struct Worker {
     pub relays: Vec<String>,
     /// The hex pubkeys whose applications are followed.
@@ -122,7 +135,7 @@ impl Worker {
 
     /// Store a live event, and say whose it was if it was new.
     async fn store(&self, event: Event) -> Option<String> {
-        if !self.authors.contains(&event.pubkey) || !nip82::KINDS.contains(&event.kind) {
+        if !self.authors.contains(&event.pubkey) || !nip82::KINDS.contains(&event.kind) || !not_future(&event) {
             return None;
         }
         let author = event.pubkey.clone();
@@ -138,10 +151,13 @@ impl Worker {
 
     /// Ask relays for everything `author` has published, then rebuild.
     async fn resync(&self, author: &str) {
-        let filter = json!({"kinds": [nip82::APPLICATION, nip82::RELEASE], "authors": [author]});
+        let kinds = [nip82::APPLICATION, nip82::RELEASE];
+        let filter = json!({"kinds": kinds, "authors": [author]});
         match relay::query(&self.relays, &[filter], QUERY_TIMEOUT).await {
             Ok(events) => {
-                let events = events.into_iter().filter(|event| event.pubkey == author).collect();
+                // A relay can send what it likes: only what was asked for is kept.
+                let events =
+                    events.into_iter().filter(|event| event.pubkey == author && kinds.contains(&event.kind) && not_future(event)).collect();
                 if let Err(error) = self.db.store_events(events).await {
                     tracing::warn!(author, ?error, "couldn't store events");
                 }
@@ -197,7 +213,10 @@ impl Worker {
             let filter = json!({"ids": ids, "kinds": [nip82::ASSET], "authors": [author]});
             match relay::query(&self.relays, &[filter], QUERY_TIMEOUT).await {
                 Ok(events) => {
-                    let events = events.into_iter().filter(|event| event.pubkey == author && event.kind == nip82::ASSET).collect();
+                    let events = events
+                        .into_iter()
+                        .filter(|event| event.pubkey == author && event.kind == nip82::ASSET && not_future(event))
+                        .collect();
                     match self.db.store_events(events).await {
                         Ok(stored) => found |= stored > 0,
                         Err(error) => tracing::warn!(author, ?error, "couldn't store events"),
@@ -210,5 +229,21 @@ impl Worker {
             }
         }
         found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_events_dated_ahead() {
+        let secret = "0000000000000000000000000000000000000000000000000000000000000001";
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let at = |created_at| Event::sign(secret, created_at, nip82::RELEASE, Vec::new(), "");
+        assert!(not_future(&at(0)));
+        assert!(not_future(&at(now + 60)));
+        assert!(!not_future(&at(now + 3600)));
+        assert!(!not_future(&at(i64::MAX)));
     }
 }

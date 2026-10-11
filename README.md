@@ -169,6 +169,19 @@ the author's asset gives, or to a Blossom server by its hash. Check the
 file against the `sha256` in the release's JSON, which comes from the
 author's signed event.
 
+Events dated more than ten minutes ahead of the gateway's clock are left
+until their time comes. One dated far ahead would stand over every later
+release of its address, and date the indexes in the future, which apt
+refuses.
+
+If an author's key is stolen, take it off `authors` and restart: the
+gateway forgets their events, and their repositories go. Deletion events
+(NIP-09) aren't followed, so there's no withdrawing a release while the key
+is on the team, short of publishing it again, later, with no assets; and a
+package version the thief published first stays pinned to their file (see
+above), so a fix has to be a new version. Under a new key, the author's
+repositories start afresh, pins included.
+
 A repository added by NIP-05 address follows the address: the gateway looks
 it up again once a day, so whoever controls the domain decides whose
 packages its users get, as long as it's someone on the team. Add it by npub
