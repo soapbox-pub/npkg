@@ -128,6 +128,10 @@ pub struct Repo {
     flatpak: HashMap<usize, FlatpakChannel>,
     /// The signature of each of `bundles`' commits, as a `.commitmeta`.
     commitmeta: HashMap<String, Vec<u8>>,
+    /// Every object those commits reach. The store is shared by every
+    /// repository, and holds what withdrawn releases left until it's
+    /// pruned, so a repository serves only these.
+    objects: HashSet<(Kind, String)>,
     /// What it was built from.
     pub snapshot: nip82::Snapshot,
     /// Whether a file was left out for a reason that might not hold next
@@ -169,6 +173,11 @@ impl Repo {
     /// The signature of one of the repository's commits.
     pub fn commitmeta(&self, commit: &str) -> Option<&[u8]> {
         self.commitmeta.get(commit).map(Vec::as_slice)
+    }
+
+    /// Whether the object is one of the repository's commits' own.
+    pub fn has_object(&self, kind: Kind, checksum: &str) -> bool {
+        self.objects.contains(&(kind, checksum.to_string()))
     }
 
     /// Where to download the file with this hash, if it's one of this
@@ -458,10 +467,12 @@ impl Repos {
                 }
             }
             let mut commitmeta = HashMap::new();
+            let mut objects = HashSet::new();
             let appstream = flatpak.values().flat_map(|channel| channel.appstream.iter().map(|branch| &branch.commit));
             for commit in bundles.iter().map(|bundle| &bundle.bundle.commit).chain(appstream) {
                 if !commitmeta.contains_key(commit) {
                     commitmeta.insert(commit.clone(), summary::signatures(&signer, &store.read(Kind::Commit, commit)?)?);
+                    objects.extend(store.reachable(commit)?);
                 }
             }
             Ok(Repo {
@@ -477,6 +488,7 @@ impl Repos {
                 bundles,
                 flatpak,
                 commitmeta,
+                objects,
                 snapshot,
                 incomplete,
             })
@@ -540,9 +552,16 @@ impl Repos {
     /// has them.
     async fn unpacked(&self, asset: &Asset, offline: bool) -> anyhow::Result<Result<Bundle, String>> {
         match self.db.bundle(&asset.sha256).await? {
-            // Pruning took its objects once no release listed it.
-            Some(Ok(bundle)) if !self.store.has(Kind::Commit, &bundle.commit) => {}
-            Some(known) => return Ok(known),
+            Some(Ok(bundle)) => {
+                // Pruning took its objects once no release listed it: some,
+                // or all. Pruning keeps what's new, so a commit unpacked
+                // again since can still be missing older objects it shares.
+                let (store, commit) = (self.store.clone(), bundle.commit.clone());
+                if tokio::task::spawn_blocking(move || store.reachable(&commit).is_ok()).await? {
+                    return Ok(Ok(bundle));
+                }
+            }
+            Some(refused) => return Ok(refused),
             None => {}
         }
         anyhow::ensure!(!offline, "The bundle isn't unpacked yet. It will be tried again when the repository is next refreshed.");
@@ -854,10 +873,35 @@ mod tests {
         assert_eq!(head(3), ["2.0.0-beta.1"]);
         assert!(repo.flatpak_file(0, "summary").is_some() && repo.flatpak_file(0, "summary.sig").is_some());
         assert!(repo.commitmeta(&bundle.commit).is_some());
+        // Its own objects, and nothing else in the store.
+        assert!(repos.store().reachable(&bundle.commit).unwrap().iter().all(|(kind, checksum)| repo.has_object(*kind, checksum)));
+        let stray = repos.store().write_file(&crate::ostree::FileMeta::plain_file(), b"someone else's").unwrap();
+        assert!(!repo.has_object(Kind::File, &stray));
         let appstream: Vec<&str> = repo.flatpak(0).unwrap().appstream.iter().map(|branch| branch.ref_name.as_str()).collect();
         assert_eq!(appstream, ["appstream/x86_64", "appstream2/x86_64"]);
         assert_eq!(repo.commits().count(), 3);
         assert!(repo.flatpak_file(0, "config").is_none());
+    }
+
+    #[tokio::test]
+    async fn unpacks_again_a_bundle_missing_an_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let repos = repos(dir.path(), &db);
+        let fixture = include_bytes!("../tests/fixtures/hello.flatpak");
+        let path = dir.path().join("hello.flatpak");
+        std::fs::write(&path, fixture).unwrap();
+        let bundle = delta::unpack(&path, repos.store()).unwrap();
+        let sha256 = hex::encode(Sha256::digest(fixture));
+        db.store_bundle(&sha256, &Ok(bundle.clone())).await.unwrap();
+        let asset = Asset { mime: nip82::FLATPAK_MIME.into(), sha256, url: None, filename: None, size: None, platforms: Vec::new() };
+        assert_eq!(repos.unpacked(&asset, true).await.unwrap(), Ok(bundle.clone()));
+
+        // Pruned of one object, though not of its commit: it has to be
+        // unpacked again, which offline it can't be.
+        let (kind, checksum) = repos.store().reachable(&bundle.commit).unwrap().into_iter().find(|(kind, _)| *kind == Kind::File).unwrap();
+        repos.store().delete(kind, &checksum).unwrap();
+        assert!(repos.unpacked(&asset, true).await.is_err());
     }
 
     #[tokio::test]

@@ -550,7 +550,9 @@ async fn flatpak_object(
             None => not_found(),
         };
     }
-    let Some(kind) = ostree::Kind::from_extension(extension) else { return not_found() };
+    let Some(kind) = ostree::Kind::from_extension(extension).filter(|&kind| repo.has_object(kind, &checksum)) else {
+        return not_found();
+    };
     let file = match tokio::fs::File::open(state.repos.store().path(kind, &checksum)).await {
         Ok(file) => file,
         Err(_) => return not_found(),
