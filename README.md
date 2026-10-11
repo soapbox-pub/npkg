@@ -191,8 +191,10 @@ or broken leaves it as it was, through restarts too.
 
 Looking up an address the gateway doesn't know yet is the one thing a
 request can make it do upstream, so those lookups are limited, per client
-and overall. Behind a reverse proxy on the same machine, the client is the
-address the proxy adds last to `X-Forwarded-For`. The lookup only goes to
+and overall. A client is its IPv4 address, or its IPv6 /64. Behind a
+reverse proxy on the same machine, the client is the address the proxy adds
+last to `X-Forwarded-For`, which the proxy has to set: `X-Real-IP` isn't
+read. The lookup only goes to
 domain names (no IP addresses, ports, or single-label hosts) that resolve
 to public addresses.
 

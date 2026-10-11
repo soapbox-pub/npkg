@@ -85,7 +85,12 @@ fn json(value: &Value) -> Response {
 /// The address of whoever made a request, for the limits on what a request
 /// can make the gateway do. The socket's peer, unless that's a reverse proxy
 /// on this machine: then the address the proxy added to `X-Forwarded-For`,
-/// last, since a client can write the ones before it.
+/// last, since a client can write the ones before it. `X-Real-IP` isn't
+/// read: behind a proxy that only sets that, a client could write its own
+/// `X-Forwarded-For`.
+///
+/// An IPv6 client is its /64, which is what one host is usually given:
+/// counted address by address, it could make itself billions of clients.
 pub struct Client(IpAddr);
 
 impl<S: Send + Sync> FromRequestParts<S> for Client {
@@ -94,12 +99,26 @@ impl<S: Send + Sync> FromRequestParts<S> for Client {
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Client, Self::Rejection> {
         let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map_or(IpAddr::from([0, 0, 0, 0]), |info| info.0.ip());
         if !peer.is_loopback() {
-            return Ok(Client(peer));
+            return Ok(Client(network(peer)));
         }
-        let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
-        let forwarded = header("x-forwarded-for").and_then(|value| value.rsplit(',').next()).and_then(|ip| ip.trim().parse().ok());
-        let real = header("x-real-ip").and_then(|ip| ip.trim().parse().ok());
-        Ok(Client(forwarded.or(real).unwrap_or(peer)))
+        let forwarded = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|ip| ip.trim().parse().ok());
+        Ok(Client(network(forwarded.unwrap_or(peer))))
+    }
+}
+
+/// The network a client is counted by: an IPv4 address, or an IPv6 /64.
+fn network(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        },
+        v4 => v4,
     }
 }
 
@@ -731,5 +750,14 @@ mod tests {
         assert_eq!(segment("buzz.armada.app"), "buzz.armada.app");
         assert_eq!(segment("My App/x"), "My%20App%2Fx");
         assert_eq!(file_stem("My App"), "My_App");
+    }
+
+    #[test]
+    fn counts_ipv6_clients_by_their_64() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(network(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(network(ip("2001:db8:1:2:bbbb::9")), ip("2001:db8:1:2::"));
+        assert_eq!(network(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+        assert_eq!(network(ip("192.0.2.1")), ip("192.0.2.1"));
     }
 }
