@@ -41,14 +41,15 @@ src/
                  application's P-256 key, derived from the gateway's
   der.rs         the DER of X.509 certificates and PKCS#7 signatures
   ostree/        Flatpak: unpacking bundles (delta.rs) into an archive-z2
-                 object store, pruning it, AppStream branches
+                 object store, pruning it, publishing their commits as
+                 a history (publish.rs), AppStream branches
                  (appstream.rs), and summaries (summary.rs)
   gvariant.rs    GLib's serialization, which OSTree's formats are made of
   signing.rs     the gateway's Ed25519 OpenPGP key, and secrets derived
                  from it
   db.rs          SQLite: the team's events, inspected package files,
-                 unpacked bundles, pins, F-Droid index dates, icons,
-                 NIP-05 keys
+                 unpacked bundles, published Flatpak commits, pins,
+                 F-Droid index dates, icons, NIP-05 keys
 tests/fixtures/  tiny real packages nfpm, flatpak and aapt2 built (see its
                  README)
 ```
@@ -90,10 +91,15 @@ one up.
 4. Render and sign every channel. Indexes are dated by their newest release,
    not by the build, so rebuilding the same packages gives the same files
    and a client between two requests never sees hashes change underneath it.
-   A channel's Flatpak summary names the newest commit of each ref, and is
-   dated by it, and its AppStream branches, made from those commits'
-   AppStream data and dated by the repository's newest commit, so the
-   same apps give the same branches.
+   A channel's Flatpak remote publishes each ref's head as `flatpak
+   build-commit-from` does: a commit of the bundle's tree on top of the last
+   one published, dated after it, made only when the head's bundle changes
+   (a ref seen first starts with every release, oldest first). The database
+   keeps that history and never rewrites it, since clients hold its ids.
+   The summary names each ref's last commit, and is dated by it, and its
+   AppStream branches, made from those commits' AppStream data (with the
+   remote's releases added for an app that lists none) and dated by the
+   repository's newest commit, so the same apps give the same branches.
    F-Droid only reads an index dated later than the last it read, so an
    F-Droid index is dated by its newest event, or, if it changed with no
    newer one (say a file that failed to download, downloaded), a
@@ -102,6 +108,8 @@ one up.
 
 Once a day, after a resync, the sync worker prunes the OSTree store of
 objects no current release's commit reaches, if they're over a day old.
+Published commits themselves are kept, so a history lists withdrawn
+releases too.
 
 ## Conventions
 

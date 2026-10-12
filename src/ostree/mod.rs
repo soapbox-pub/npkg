@@ -8,6 +8,7 @@
 
 pub mod appstream;
 pub mod delta;
+pub mod publish;
 pub mod summary;
 
 use std::collections::HashSet;
@@ -386,11 +387,13 @@ impl Store {
 
     /// Delete every object not reachable from `keep` and older than
     /// `grace`, and return how many went and their size. A commit in `keep`
-    /// that's missing keeps nothing, and isn't an error: its bundle is
-    /// unpacked again when it's next needed.
+    /// whose tree is missing keeps only itself, and isn't an error: its
+    /// bundle is unpacked again when it's next needed, and a history goes
+    /// back past a withdrawn release.
     pub fn prune(&self, keep: &HashSet<String>, grace: std::time::Duration) -> Result<(usize, u64)> {
         let mut reachable = HashSet::new();
         for commit in keep {
+            reachable.insert((Kind::Commit, commit.clone()));
             if let Ok(objects) = self.reachable(commit) {
                 reachable.extend(objects);
             }

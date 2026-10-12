@@ -12,7 +12,7 @@ use crate::gvariant::{Type, Value};
 use crate::ostree::delta::Bundle;
 use crate::signing::Signer;
 
-/// The summary for `refs`, each the commit a bundle carried. Dated by the
+/// The summary for `refs`, each the commit published for it. Dated by the
 /// newest commit, so the same refs give the same bytes.
 pub fn render(refs: &[&Bundle]) -> Vec<u8> {
     let mut refs: Vec<&Bundle> = refs.to_vec();
@@ -84,6 +84,7 @@ mod tests {
             installed_size: 1536,
             download_size: 38,
             metadata: "[Application]\nname=org.example.Hello\n".into(),
+            runtime_repo: None,
         };
         let bytes = render(&[&bundle]);
         let summary = Value::read(&bytes, &Type::parse("(a(s(taya{sv}))a{sv})").unwrap()).unwrap();

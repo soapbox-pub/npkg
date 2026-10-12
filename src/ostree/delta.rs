@@ -46,6 +46,10 @@ pub struct Bundle {
     pub download_size: u64,
     /// The app's `metadata` file: its runtime, permissions, and so on.
     pub metadata: String,
+    /// The `.flatpakrepo` its runtime comes from, if the bundle names one
+    /// (`flatpak build-bundle --runtime-repo`).
+    #[serde(default)]
+    pub runtime_repo: Option<String>,
 }
 
 /// Unpack the bundle at `path` into `store`, and describe the commit it
@@ -137,7 +141,18 @@ fn describe(commit: &Value, checksum: &str, commit_size: u64, bundle_metadata: &
         installed_size: big_endian("xa.installed-size").unwrap_or(0),
         download_size: big_endian("xa.download-size").unwrap_or(0),
         metadata: app_metadata,
+        runtime_repo: bundle_metadata
+            .lookup("runtime-repo")
+            .and_then(Value::as_str)
+            .filter(|url| valid_runtime_repo(url))
+            .map(str::to_string),
     })
+}
+
+/// Whether `url` can go in a `.flatpakref` as its `RuntimeRepo`: https, and
+/// on one line. One that can't is ignored, and Flathub named instead.
+fn valid_runtime_repo(url: &str) -> bool {
+    url.len() <= 2048 && url.starts_with("https://") && !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// `app/<id>/<arch>/<branch>`, in the characters Flatpak allows.
@@ -380,6 +395,7 @@ mod tests {
         assert!(bundle.metadata.contains("command=hello"));
         assert_eq!(bundle.timestamp, 1_767_225_600);
         assert_eq!(bundle.commit_size, 628);
+        assert_eq!(bundle.runtime_repo, None);
         // Every object `flatpak build-export` made: see tests/fixtures/README.md.
         let objects = store.reachable(COMMIT).unwrap();
         assert_eq!(objects.len(), 22);
@@ -463,6 +479,14 @@ mod tests {
     fn names_deltas_as_ostree_does() {
         let to = hex::decode("636648e7dd532e91d0ba87803f2c135e1f5435ecb7e6482ac716cd677be5734f").unwrap();
         assert_eq!(b64_path(&to), "Y2/ZI591TLpHQuoeAPywTXh9UNey35kgqxxbNZ3vlc08");
+    }
+
+    #[test]
+    fn takes_only_a_runtime_repo_a_flatpakref_can_hold() {
+        assert!(valid_runtime_repo("https://dl.flathub.org/repo/flathub.flatpakrepo"));
+        assert!(!valid_runtime_repo("http://dl.flathub.org/repo/flathub.flatpakrepo"));
+        assert!(!valid_runtime_repo("https://example.com/x.flatpakrepo\nGPGKey=mine"));
+        assert!(!valid_runtime_repo("https://example.com/a b"));
     }
 
     #[test]

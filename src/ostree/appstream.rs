@@ -12,6 +12,11 @@
 //!
 //! An app whose data is missing or unreadable is left out of the listing,
 //! as Flatpak leaves it out; it still installs.
+//!
+//! One thing is added that Flatpak doesn't add: an app that lists no
+//! `<releases>` of its own is given the NIP-82 releases the remote has a
+//! bundle of, so GNOME Software and `flatpak search` show its version. An
+//! app's own are left as they are.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -37,21 +42,36 @@ const MAX_DEPTH: usize = 64;
 
 const ICON_SIZES: [&str; 2] = ["64x64", "128x128"];
 
+/// A release of an app, for one that lists none of its own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppRelease {
+    pub version: String,
+    pub timestamp: i64,
+    /// From a channel less stable than `main`, or a prerelease version.
+    pub development: bool,
+}
+
+/// An app on the remote: its newest commit, and its releases, newest first.
+pub struct App<'a> {
+    pub bundle: &'a Bundle,
+    pub releases: &'a [AppRelease],
+}
+
 /// Make the AppStream branches for `apps`, writing their objects to
 /// `store`, and describe their commits. Commits are dated `timestamp`, so
 /// the same apps give the same commits.
-pub fn build(store: &Store, apps: &[&Bundle], timestamp: u64) -> Result<Vec<Bundle>> {
-    let arches: BTreeSet<&str> = apps.iter().filter_map(|app| app.ref_name.split('/').nth(2)).collect();
+pub fn build(store: &Store, apps: &[App], timestamp: u64) -> Result<Vec<Bundle>> {
+    let arches: BTreeSet<&str> = apps.iter().filter_map(|app| app.bundle.ref_name.split('/').nth(2)).collect();
     let mut branches = Vec::new();
     for arch in arches {
-        let mut refs: Vec<&Bundle> = apps.iter().copied().filter(|app| app.ref_name.split('/').nth(2) == Some(arch)).collect();
-        refs.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
+        let mut refs: Vec<&App> = apps.iter().filter(|app| app.bundle.ref_name.split('/').nth(2) == Some(arch)).collect();
+        refs.sort_by(|a, b| a.bundle.ref_name.cmp(&b.bundle.ref_name));
 
         let mut components = Vec::new();
         let mut icons: [BTreeMap<String, String>; 2] = Default::default();
         for app in refs {
             if let Err(error) = extract(store, app, &mut components, &mut icons) {
-                tracing::info!(r#ref = app.ref_name, error = format!("{error:#}"), "no AppStream data");
+                tracing::info!(r#ref = app.bundle.ref_name, error = format!("{error:#}"), "no AppStream data");
             }
         }
         let xml = serialize(components);
@@ -67,7 +87,12 @@ pub fn build(store: &Store, apps: &[&Bundle], timestamp: u64) -> Result<Vec<Bund
 
 /// Add `app`'s components to `components`, and the icons of every component
 /// named after it to `icons`, by size.
-fn extract(store: &Store, app: &Bundle, components: &mut Vec<Element>, icons: &mut [BTreeMap<String, String>; 2]) -> Result<()> {
+fn extract(
+    store: &Store,
+    App { bundle: app, releases }: &App,
+    components: &mut Vec<Element>,
+    icons: &mut [BTreeMap<String, String>; 2],
+) -> Result<()> {
     let id = app.ref_name.split('/').nth(1).ok_or_else(|| anyhow!("The ref names no app."))?;
     let path = format!("files/share/app-info/xmls/{id}.xml.gz");
     let checksum = store.lookup(&app.commit, &path)?.ok_or_else(|| anyhow!("The app has no {path}."))?;
@@ -85,7 +110,7 @@ fn extract(store: &Store, app: &Bundle, components: &mut Vec<Element>, icons: &m
     let mut migrated = false;
     for child in &source.children {
         if let Node::Element(component) = child
-            && let Some(component) = validate(component.clone(), &app.ref_name, id, &tags, keys.get("runtime"), keys.get("sdk"))
+            && let Some(component) = validate(component.clone(), &app.ref_name, id, &tags, keys.get("runtime"), keys.get("sdk"), releases)
         {
             components.push(component);
             migrated = true;
@@ -113,8 +138,17 @@ fn extract(store: &Store, app: &Bundle, components: &mut Vec<Element>, icons: &m
 }
 
 /// `component` fit for the merged listing, if it belongs to `id`: its own
-/// `<bundle>` replaced by one naming `ref_name`, and the app's tags added.
-fn validate(mut component: Element, ref_name: &str, id: &str, tags: &[&str], runtime: Option<&str>, sdk: Option<&str>) -> Option<Element> {
+/// `<bundle>` replaced by one naming `ref_name`, the app's tags added, and,
+/// if it's the app's own and lists none, `releases`.
+fn validate(
+    mut component: Element,
+    ref_name: &str,
+    id: &str,
+    tags: &[&str],
+    runtime: Option<&str>,
+    sdk: Option<&str>,
+    releases: &[AppRelease],
+) -> Option<Element> {
     let mut id_text = component_id(&component)?.trim_ascii();
     if !id.ends_with(".desktop") {
         id_text = id_text.strip_suffix(".desktop").unwrap_or(id_text);
@@ -122,8 +156,25 @@ fn validate(mut component: Element, ref_name: &str, id: &str, tags: &[&str], run
     if !id_text.starts_with(id) {
         return None;
     }
+    let own = id_text == id;
 
     component.children.retain(|child| !matches!(child, Node::Element(element) if element.name == "bundle"));
+    let listed = component.children.iter().any(|child| matches!(child, Node::Element(element) if element.name == "releases"));
+    if own && !listed && !releases.is_empty() {
+        let mut children = Vec::new();
+        for release in releases {
+            let mut attrs =
+                vec![("version".to_string(), release.version.clone()), ("timestamp".to_string(), release.timestamp.to_string())];
+            if release.development {
+                attrs.push(("type".into(), "development".into()));
+            }
+            children
+                .extend([Node::Text("\n      ".into()), Node::Element(Element { name: "release".into(), attrs, children: Vec::new() })]);
+        }
+        children.push(Node::Text("\n    ".into()));
+        let releases = Element { name: "releases".into(), attrs: Vec::new(), children };
+        component.children.extend([Node::Text("  ".into()), Node::Element(releases), Node::Text("\n  ".into())]);
+    }
     let mut attrs = vec![("type".to_string(), "flatpak".to_string())];
     if let Some(runtime) = runtime.filter(|runtime| !runtime.starts_with("runtime/")) {
         attrs.push(("runtime".into(), runtime.into()));
@@ -237,6 +288,7 @@ fn write_branch(
         installed_size,
         download_size,
         metadata: String::new(),
+        runtime_repo: None,
     })
 }
 
@@ -418,7 +470,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("ostree")).unwrap();
         let app = hello(&store, dir.path());
-        let branches = build(&store, &[&app], 1_767_225_600).unwrap();
+        let apps = [App { bundle: &app, releases: &[] }];
+        let branches = build(&store, &apps, 1_767_225_600).unwrap();
         let names: Vec<&str> = branches.iter().map(|branch| branch.ref_name.as_str()).collect();
         assert_eq!(names, ["appstream/x86_64", "appstream2/x86_64"]);
 
@@ -441,7 +494,46 @@ mod tests {
         assert!(store.reachable(&appstream.commit).is_ok());
 
         // The same apps, the same commits.
-        assert_eq!(build(&store, &[&app], 1_767_225_600).unwrap(), branches);
+        assert_eq!(build(&store, &apps, 1_767_225_600).unwrap(), branches);
+    }
+
+    #[test]
+    fn lists_releases_for_an_app_that_lists_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("ostree")).unwrap();
+        let app = hello(&store, dir.path());
+        let releases = [
+            AppRelease { version: "1.1.0-rc.1".into(), timestamp: 200, development: true },
+            AppRelease { version: "1.0.0".into(), timestamp: 100, development: false },
+        ];
+        let branches = build(&store, &[App { bundle: &app, releases: &releases }], 1).unwrap();
+        let xml = store.file_content(&store.lookup(&branches[1].commit, "appstream.xml").unwrap().unwrap(), MAX_FILE).unwrap();
+        let expected = include_str!("../../tests/fixtures/hello.appstream.xml").replace(
+            "\n    <bundle ",
+            "\n    <releases>\n      <release version=\"1.1.0-rc.1\" timestamp=\"200\" type=\"development\"/>\n      \
+             <release version=\"1.0.0\" timestamp=\"100\"/>\n    </releases>\n    <bundle ",
+        );
+        assert_eq!(String::from_utf8(xml).unwrap(), expected);
+    }
+
+    #[test]
+    fn keeps_an_apps_own_releases() {
+        let release = Element { name: "release".into(), attrs: vec![("version".into(), "9".into())], children: Vec::new() };
+        let own = Element { name: "releases".into(), attrs: Vec::new(), children: vec![Node::Element(release)] };
+        let id = Element { name: "id".into(), attrs: Vec::new(), children: vec![Node::Text("org.example.Hello".into())] };
+        let component =
+            Element { name: "component".into(), attrs: Vec::new(), children: vec![Node::Element(id), Node::Element(own.clone())] };
+        let ours = [AppRelease { version: "1.0.0".into(), timestamp: 100, development: false }];
+        let validated = validate(component, "app/org.example.Hello/x86_64/stable", "org.example.Hello", &[], None, None, &ours).unwrap();
+        let listed: Vec<&Element> = validated
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                Node::Element(element) if element.name == "releases" => Some(element),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, [&own]);
     }
 
     #[test]
@@ -450,7 +542,7 @@ mod tests {
         let store = Store::open(&dir.path().join("ostree")).unwrap();
         let app = hello(&store, dir.path());
         let renamed = Bundle { ref_name: "app/org.example.Other/x86_64/stable".into(), ..app };
-        let branches = build(&store, &[&renamed], 1).unwrap();
+        let branches = build(&store, &[App { bundle: &renamed, releases: &[] }], 1).unwrap();
         let xml = store.file_content(&store.lookup(&branches[1].commit, "appstream.xml").unwrap().unwrap(), MAX_FILE).unwrap();
         assert_eq!(
             String::from_utf8(xml).unwrap(),

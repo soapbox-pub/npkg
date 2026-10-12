@@ -21,12 +21,13 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
-use crate::db::{Db, Inspected};
+use crate::db::{Db, Inspected, Published};
 use crate::inspect::{self, Format, Meta};
 use crate::nip82::{self, Asset};
 use crate::nostr::nip19;
+use crate::ostree::appstream::{App, AppRelease};
 use crate::ostree::delta::{self, Bundle};
-use crate::ostree::{Kind, Store, appstream, summary};
+use crate::ostree::{Kind, Store, appstream, publish, summary};
 use crate::signing::Signer;
 use crate::{apt, fdroid, net, rpmmd};
 
@@ -92,7 +93,11 @@ pub struct FlatpakBundle {
 /// One channel's Flatpak remote: the newest commit of each ref, the
 /// AppStream branches that list them, and the signed summary that says so.
 pub struct FlatpakChannel {
+    /// Each ref's head: the bundle it was published from, and, as its
+    /// `bundle`, the commit published.
     pub refs: Vec<FlatpakBundle>,
+    /// Every commit published on the channel, by ref, oldest first.
+    pub history: Vec<Published>,
     pub appstream: Vec<Bundle>,
     summary: Vec<u8>,
     summary_sig: Vec<u8>,
@@ -147,7 +152,7 @@ pub struct Repo {
     pub bundles: Vec<FlatpakBundle>,
     /// By channel, for each channel some release has a bundle on.
     flatpak: HashMap<usize, FlatpakChannel>,
-    /// The signature of each of `bundles`' commits, as a `.commitmeta`.
+    /// The signature of each commit served, as a `.commitmeta`.
     commitmeta: HashMap<String, Vec<u8>>,
     /// Every object those commits reach. The store is shared by every
     /// repository, and holds what withdrawn releases left until it's
@@ -185,10 +190,11 @@ impl Repo {
         }
     }
 
-    /// Every commit the repository's Flatpak remotes serve, or could: each
-    /// release's, and each channel's AppStream branches'.
+    /// Every commit the store keeps for the repository: each it published,
+    /// each channel's AppStream branches', and each its bundles carried,
+    /// which say a bundle needn't be unpacked again.
     pub fn commits(&self) -> impl Iterator<Item = &str> {
-        self.commitmeta.keys().map(String::as_str)
+        self.commitmeta.keys().map(String::as_str).chain(self.bundles.iter().map(|bundle| bundle.bundle.commit.as_str()))
     }
 
     /// The signature of one of the repository's commits.
@@ -221,7 +227,13 @@ impl Repo {
 }
 
 fn latest(releases: &[Release], rank: usize) -> Option<&Release> {
-    releases.iter().find(|release| release.channel <= rank && (rank > 0 || !nip82::is_prerelease(&release.version)))
+    releases.iter().find(|release| on_channel(release, rank))
+}
+
+/// Whether the channel ranked `rank` has `release`: it's on that channel or
+/// a more stable one, and, on the stable one, isn't a prerelease version.
+fn on_channel(release: &Release, rank: usize) -> bool {
+    release.channel <= rank && (rank > 0 || !nip82::is_prerelease(&release.version))
 }
 
 /// `releases`, highest version first, and the newest first of equal ones.
@@ -499,27 +511,43 @@ impl Repos {
             },
             None => None,
         };
+        let mut history = self.db.flatpak_history(pubkey, d).await?;
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let store = self.store.clone();
-        let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<(Repo, Option<(String, i64)>)> {
+        // The repository, its F-Droid index's hash and date if they changed,
+        // and the commits newly published.
+        type Built = (Repo, Option<(String, i64)>, Vec<Published>);
+        let repo = tokio::task::spawn_blocking(move || -> anyhow::Result<Built> {
             let mut apt = HashMap::new();
             let mut rpm = HashMap::new();
-            let mut flatpak = HashMap::new();
-            // The newest app's date, so AppStream commits are made again
-            // the same until an app changes, and never go back in time.
-            let appstream_date = bundles.iter().map(|bundle| bundle.bundle.timestamp).max().unwrap_or(0);
             for (rank, channel) in CHANNELS.iter().enumerate() {
                 let included: Vec<&Package> = packages.iter().filter(|package| package.channel <= rank).collect();
                 apt.insert(channel.to_string(), apt::render(channel, &d, &description, &included, &signer)?);
                 rpm.insert(rank, rpmmd::render(&included, &signer)?);
+            }
+
+            let stored = history.len();
+            let mut heads = Vec::new();
+            for rank in 0..CHANNELS.len() {
                 let refs = flatpak_heads(&releases, &bundles, rank);
                 if !refs.is_empty() {
-                    let apps: Vec<&Bundle> = refs.iter().map(|head| &head.bundle).collect();
-                    let appstream = appstream::build(&store, &apps, appstream_date)?;
-                    let summary = summary::render(&apps.iter().copied().chain(&appstream).collect::<Vec<_>>());
-                    let summary_sig = summary::signatures(&signer, &summary)?;
-                    flatpak.insert(rank, FlatpakChannel { refs, appstream, summary, summary_sig });
+                    heads.push((rank, publish_heads(&store, &name, rank, &releases, &bundles, refs, &mut history)?));
                 }
+            }
+            let published = history[stored..].to_vec();
+            // The newest commit's date, so AppStream commits are made again
+            // the same until an app changes, and never go back in time.
+            let appstream_date = history.iter().map(|published| published.timestamp).max().unwrap_or(0);
+            let mut flatpak = HashMap::new();
+            for (rank, refs) in heads {
+                let releases: Vec<Vec<AppRelease>> =
+                    refs.iter().map(|head| app_releases(&releases, &bundles, rank, &head.bundle.ref_name)).collect();
+                let apps: Vec<App> = refs.iter().zip(&releases).map(|(head, releases)| App { bundle: &head.bundle, releases }).collect();
+                let appstream = appstream::build(&store, &apps, appstream_date)?;
+                let summary = summary::render(&refs.iter().map(|head| &head.bundle).chain(&appstream).collect::<Vec<_>>());
+                let summary_sig = summary::signatures(&signer, &summary)?;
+                let history = history.iter().filter(|published| published.channel == CHANNELS[rank]).cloned().collect();
+                flatpak.insert(rank, FlatpakChannel { refs, history, appstream, summary, summary_sig });
             }
             let apks: Vec<&Package> = packages.iter().filter(|package| package.meta.format() == Format::Apk).collect();
             let fdroid = (!apks.is_empty()).then(|| {
@@ -558,8 +586,26 @@ impl Repos {
             });
             let mut commitmeta = HashMap::new();
             let mut objects = HashSet::new();
-            let appstream = flatpak.values().flat_map(|channel| channel.appstream.iter().map(|branch| &branch.commit));
-            for commit in bundles.iter().map(|bundle| &bundle.bundle.commit).chain(appstream) {
+            // Every commit published is served, so the whole history can be
+            // listed, though a withdrawn release's files may be pruned.
+            let mut walked = HashSet::new();
+            for published in &history {
+                anyhow::ensure!(
+                    publish::checksum(&published.object) == published.commit,
+                    "The stored commit {} doesn't match its checksum.",
+                    published.commit
+                );
+                store.write(Kind::Commit, &published.commit, &published.object)?;
+                commitmeta.insert(published.commit.clone(), summary::signatures(&signer, &published.object)?);
+                objects.insert((Kind::Commit, published.commit.clone()));
+                // Its tree is its bundle's, walked once.
+                if walked.insert(published.source.clone())
+                    && let Ok(reachable) = store.reachable(&published.source)
+                {
+                    objects.extend(reachable.into_iter().filter(|(kind, _)| *kind != Kind::Commit));
+                }
+            }
+            for commit in flatpak.values().flat_map(|channel| channel.appstream.iter().map(|branch| &branch.commit)) {
                 if !commitmeta.contains_key(commit) {
                     commitmeta.insert(commit.clone(), summary::signatures(&signer, &store.read(Kind::Commit, commit)?)?);
                     objects.extend(store.reachable(commit)?);
@@ -587,13 +633,17 @@ impl Repos {
                 snapshot,
                 incomplete,
             };
-            Ok((repo, dated))
+            Ok((repo, dated, published))
         })
         .await??;
-        let (repo, dated) = repo;
+        let (repo, dated, published) = repo;
         // Stored, so that the next build dates it afresh only if it changes.
         if let Some((content, timestamp)) = dated {
             self.db.store_fdroid_index(&repo.pubkey, &repo.d, &content, timestamp).await?;
+        }
+        // Before it's served: clients will hold these ids.
+        if !published.is_empty() {
+            self.db.store_flatpak_history(&repo.pubkey, &repo.d, published).await?;
         }
 
         tracing::info!(
@@ -789,7 +839,7 @@ impl Repos {
 /// release only shipped another architecture.
 fn flatpak_heads(releases: &[Release], bundles: &[FlatpakBundle], rank: usize) -> Vec<FlatpakBundle> {
     let mut heads: Vec<FlatpakBundle> = Vec::new();
-    for release in releases.iter().filter(|release| release.channel <= rank && (rank > 0 || !nip82::is_prerelease(&release.version))) {
+    for release in releases.iter().filter(|release| on_channel(release, rank)) {
         for bundle in bundles.iter().filter(|bundle| bundle.release == release.version && bundle.created_at == release.created_at) {
             if !heads.iter().any(|head| head.bundle.ref_name == bundle.bundle.ref_name) {
                 heads.push(bundle.clone());
@@ -797,6 +847,99 @@ fn flatpak_heads(releases: &[Release], bundles: &[FlatpakBundle], rank: usize) -
         }
     }
     heads
+}
+
+/// `release`'s bundle of `ref_name`, if it has one.
+fn bundle_of<'a>(bundles: &'a [FlatpakBundle], release: &Release, ref_name: &str) -> Option<&'a FlatpakBundle> {
+    bundles
+        .iter()
+        .find(|bundle| bundle.release == release.version && bundle.created_at == release.created_at && bundle.bundle.ref_name == ref_name)
+}
+
+/// Each of `heads`, as the channel ranked `rank` publishes it: the commit at
+/// the top of its ref's history if that was made from the same bundle, or
+/// else a new one on top, which is added to `history`. A ref with no history
+/// yet starts one with every release the channel has a bundle of, oldest
+/// version first, so its log goes back as far as the releases do.
+fn publish_heads(
+    store: &Store,
+    name: &str,
+    rank: usize,
+    releases: &[Release],
+    bundles: &[FlatpakBundle],
+    heads: Vec<FlatpakBundle>,
+    history: &mut Vec<Published>,
+) -> anyhow::Result<Vec<FlatpakBundle>> {
+    let channel = CHANNELS[rank];
+    let mut published = Vec::new();
+    for head in heads {
+        let ref_name = head.bundle.ref_name.clone();
+        let mut tip =
+            history.iter().filter(|past| past.channel == channel && past.ref_name == ref_name).max_by_key(|past| past.seq).cloned();
+        if tip.as_ref().is_none_or(|tip| tip.source != head.bundle.commit) {
+            let pending = if tip.is_some() {
+                vec![head.clone()]
+            } else {
+                let mut all: Vec<FlatpakBundle> = Vec::new();
+                let oldest_first = releases.iter().rev().filter(|release| on_channel(release, rank));
+                for bundle in oldest_first.filter_map(|release| bundle_of(bundles, release, &ref_name)) {
+                    // A bundle the next release lists again is published once,
+                    // as that release's.
+                    if all.last().is_some_and(|last| last.bundle.commit == bundle.bundle.commit) {
+                        all.pop();
+                    }
+                    all.push(bundle.clone());
+                }
+                if all.last().map(|last| (&last.bundle.commit, &last.release)) != Some((&head.bundle.commit, &head.release)) {
+                    all.push(head.clone());
+                }
+                all
+            };
+            for source in pending {
+                // After its parent, or Flatpak would refuse it as a downgrade.
+                let timestamp = tip.as_ref().map_or(source.bundle.timestamp, |tip| source.bundle.timestamp.max(tip.timestamp + 1));
+                let notes = releases
+                    .iter()
+                    .find(|release| release.version == source.release && release.created_at == source.created_at)
+                    .map_or("", |release| release.notes.as_str());
+                let subject = format!("{name} {}", source.release);
+                let parent = tip.as_ref().map(|tip| tip.commit.as_str());
+                let object = publish::commit(store, &source.bundle, parent, &subject, notes, timestamp)?;
+                let next = Published {
+                    channel: channel.to_string(),
+                    ref_name: ref_name.clone(),
+                    seq: tip.as_ref().map_or(0, |tip| tip.seq + 1),
+                    commit: publish::checksum(&object),
+                    source: source.bundle.commit.clone(),
+                    version: source.release.clone(),
+                    timestamp,
+                    object,
+                };
+                history.push(next.clone());
+                tip = Some(next);
+            }
+        }
+        let Some(tip) = tip else { anyhow::bail!("{ref_name} has nothing published on the {channel} channel.") };
+        let bundle = Bundle { commit: tip.commit, commit_size: tip.object.len() as u64, timestamp: tip.timestamp, ..head.bundle.clone() };
+        published.push(FlatpakBundle { bundle, ..head });
+    }
+    Ok(published)
+}
+
+/// The releases of `ref_name` on the channel ranked `rank`, for AppStream:
+/// each version with a bundle of it, newest first.
+fn app_releases(releases: &[Release], bundles: &[FlatpakBundle], rank: usize, ref_name: &str) -> Vec<AppRelease> {
+    let mut listed: Vec<AppRelease> = Vec::new();
+    for release in releases.iter().filter(|release| on_channel(release, rank)) {
+        if bundle_of(bundles, release, ref_name).is_some() && !listed.iter().any(|listed| listed.version == release.version) {
+            listed.push(AppRelease {
+                version: release.version.clone(),
+                timestamp: release.created_at,
+                development: release.channel > 0 || nip82::is_prerelease(&release.version),
+            });
+        }
+    }
+    listed
 }
 
 /// A package version, as apt and dnf tell one from another: name, version
@@ -1037,15 +1180,109 @@ mod tests {
         assert_eq!(head(1), ["2.0.0-beta.1"]);
         assert_eq!(head(3), ["2.0.0-beta.1"]);
         assert!(repo.flatpak_file(0, "summary").is_some() && repo.flatpak_file(0, "summary.sig").is_some());
-        assert!(repo.commitmeta(&bundle.commit).is_some());
+        // What's served is a commit published from the bundle, not the
+        // bundle's own, which the store keeps all the same.
+        let head = &repo.flatpak(0).unwrap().refs[0].bundle;
+        assert_ne!(head.commit, bundle.commit);
+        assert!(repo.commitmeta(&head.commit).is_some() && repo.commitmeta(&bundle.commit).is_none());
+        assert!(repo.commits().any(|commit| commit == bundle.commit));
         // Its own objects, and nothing else in the store.
-        assert!(repos.store().reachable(&bundle.commit).unwrap().iter().all(|(kind, checksum)| repo.has_object(*kind, checksum)));
+        assert!(repos.store().reachable(&head.commit).unwrap().iter().all(|(kind, checksum)| repo.has_object(*kind, checksum)));
+        assert!(!repo.has_object(Kind::Commit, &bundle.commit));
         let stray = repos.store().write_file(&crate::ostree::FileMeta::plain_file(), b"someone else's").unwrap();
         assert!(!repo.has_object(Kind::File, &stray));
         let appstream: Vec<&str> = repo.flatpak(0).unwrap().appstream.iter().map(|branch| branch.ref_name.as_str()).collect();
         assert_eq!(appstream, ["appstream/x86_64", "appstream2/x86_64"]);
-        assert_eq!(repo.commits().count(), 3);
         assert!(repo.flatpak_file(0, "config").is_none());
+        // One bundle in two releases is published once, as the later one's.
+        let beta: Vec<&str> = repo.flatpak(1).unwrap().history.iter().map(|published| published.version.as_str()).collect();
+        assert_eq!(beta, ["2.0.0-beta.1"]);
+    }
+
+    /// The fixture bundle, and a second one with the same tree, stored as
+    /// unpacked; and releases of them, by version, date and bundle.
+    async fn two_bundles(repos: &Repos, db: &Db, dir: &std::path::Path) -> [(String, Bundle); 2] {
+        let path = dir.join("hello.flatpak");
+        std::fs::write(&path, include_bytes!("../tests/fixtures/hello.flatpak")).unwrap();
+        let first = delta::unpack(&path, repos.store()).unwrap();
+        let object = publish::commit(repos.store(), &first, None, "another build", "", first.timestamp).unwrap();
+        let second = Bundle { commit: publish::checksum(&object), ..first.clone() };
+        let bundles = [("a".repeat(64), first), ("b".repeat(64), second)];
+        for (sha256, bundle) in &bundles {
+            db.store_bundle(sha256, &Ok(bundle.clone())).await.unwrap();
+        }
+        bundles
+    }
+
+    fn flatpak_snapshot(releases: &[(&str, i64, &str)]) -> nip82::Snapshot {
+        let release = |&(version, created_at, sha256): &(&str, i64, &str)| nip82::Release {
+            version: version.into(),
+            channel: "main".into(),
+            created_at,
+            notes: format!("Notes for {version}."),
+            assets: vec![Asset {
+                mime: nip82::FLATPAK_MIME.into(),
+                sha256: sha256.into(),
+                url: None,
+                filename: None,
+                size: None,
+                platforms: Vec::new(),
+            }],
+        };
+        nip82::Snapshot { application: None, releases: releases.iter().map(release).collect() }
+    }
+
+    #[tokio::test]
+    async fn publishes_each_head_on_top_of_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let repos = repos(dir.path(), &db);
+        let [(a, first), (b, second)] = two_bundles(&repos, &db, dir.path()).await;
+        let ref_name = first.ref_name.clone();
+        let stable = |repo: &Repo| repo.flatpak(0).unwrap().history.clone();
+
+        // A ref seen for the first time starts with every release, oldest
+        // version first, each on top of the one before.
+        let both = flatpak_snapshot(&[("1.1.0", 200, &b), ("1.0.0", 100, &a)]);
+        let repo = repos.build("pk", "hello", &both, true).await.unwrap();
+        let history = stable(&repo);
+        let versions: Vec<&str> = history.iter().map(|published| published.version.as_str()).collect();
+        assert_eq!(versions, ["1.0.0", "1.1.0"]);
+        assert_eq!([&history[0].source, &history[1].source], [&first.commit, &second.commit]);
+        assert_eq!(publish::tests::parent(&history[0].object), None);
+        assert_eq!(publish::tests::parent(&history[1].object), Some(history[0].commit.clone()));
+        assert!(history[1].timestamp > history[0].timestamp);
+        let head = repo.flatpak(0).unwrap().refs[0].bundle.clone();
+        assert_eq!((head.commit.as_str(), head.timestamp), (history[1].commit.as_str(), history[1].timestamp));
+        assert!(repo.commitmeta(&history[0].commit).is_some() && repo.has_object(Kind::Commit, &history[0].commit));
+        assert_eq!(db.flatpak_history("pk", "hello").await.unwrap().len(), 8);
+
+        // Built again, by this process or another, nothing new is published.
+        let again = repos.build("pk", "hello", &both, true).await.unwrap();
+        assert_eq!(stable(&again), history);
+        let restarted = super::tests::repos(dir.path(), &db).build("pk", "hello", &both, true).await.unwrap();
+        assert_eq!(restarted.flatpak(0).unwrap().refs[0].bundle, head);
+        assert_eq!(restarted.flatpak_file(0, "summary"), repo.flatpak_file(0, "summary"));
+        assert_eq!(db.flatpak_history("pk", "hello").await.unwrap().len(), 8);
+
+        // 1.1.0 withdrawn: 1.0.0 is published again, on top and dated after,
+        // so clients update to it rather than refuse it as a downgrade.
+        let withdrawn = flatpak_snapshot(&[("1.0.0", 100, &a)]);
+        let repo = repos.build("pk", "hello", &withdrawn, true).await.unwrap();
+        let history = stable(&repo);
+        assert_eq!(history.len(), 3);
+        assert_eq!((history[2].version.as_str(), &history[2].source, history[2].seq), ("1.0.0", &first.commit, 2));
+        assert_eq!(publish::tests::parent(&history[2].object), Some(history[1].commit.clone()));
+        assert!(history[2].timestamp > history[1].timestamp);
+        assert_eq!(repo.flatpak(0).unwrap().refs[0].bundle.commit, history[2].commit);
+        assert!(history.iter().all(|published| published.ref_name == ref_name));
+
+        // And AppStream lists the releases the remote has, for an app that
+        // lists none of its own.
+        let appstream2 = &repo.flatpak(0).unwrap().appstream[1];
+        let xml = repos.store().lookup(&appstream2.commit, "appstream.xml").unwrap().unwrap();
+        let xml = String::from_utf8(repos.store().file_content(&xml, 1 << 20).unwrap()).unwrap();
+        assert!(xml.contains("<release version=\"1.0.0\" timestamp=\"100\"/>") && !xml.contains("1.1.0"), "{xml}");
     }
 
     #[tokio::test]

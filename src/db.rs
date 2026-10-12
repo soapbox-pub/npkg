@@ -1,8 +1,9 @@
 //! SQLite: the NIP-82 events the gateway follows, what each package file was
 //! found to be, which commit each Flatpak bundle carried, which file each
 //! package version is pinned to, how each F-Droid index was last dated and
-//! the icons they show, and the key each NIP-05 address last named. With those, every repository is rebuilt
-//! after a restart without the network.
+//! the icons they show, the commits each Flatpak remote published, and the
+//! key each NIP-05 address last named. With those, every repository is
+//! rebuilt after a restart without the network.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,6 +20,21 @@ use crate::ostree::delta::Bundle;
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// A commit a channel's Flatpak remote published for a ref.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Published {
+    pub channel: String,
+    pub ref_name: String,
+    /// Its place in the ref's history, from 0.
+    pub seq: i64,
+    pub commit: String,
+    /// The commit of the bundle it was made from.
+    pub source: String,
+    pub version: String,
+    pub timestamp: u64,
+    pub object: Vec<u8>,
 }
 
 /// A package file, inspected. Keyed by its sha256, so it never goes stale.
@@ -88,6 +104,24 @@ impl Db {
              CREATE TABLE IF NOT EXISTS icons (
                url TEXT PRIMARY KEY,
                data BLOB NOT NULL
+             );
+             -- Every commit each channel's Flatpak remote published for a
+             -- ref, each on top of the one before, as flat-manager
+             -- publishes. Never rewritten: clients hold these ids.
+             CREATE TABLE IF NOT EXISTS flatpak_history (
+               pubkey TEXT NOT NULL,
+               d TEXT NOT NULL,
+               channel TEXT NOT NULL,
+               ref TEXT NOT NULL,
+               seq INTEGER NOT NULL,
+               -- The commit, and the bundle's commit it has the tree of.
+               checksum TEXT NOT NULL,
+               source TEXT NOT NULL,
+               version TEXT NOT NULL,
+               timestamp INTEGER NOT NULL,
+               -- The commit object, so it can be written again if it's lost.
+               object BLOB NOT NULL,
+               PRIMARY KEY (pubkey, d, channel, ref, seq)
              );
              DROP TABLE IF EXISTS snapshots;",
         )?;
@@ -225,6 +259,60 @@ impl Db {
         })
         .await?;
         Ok(())
+    }
+
+    /// Every commit `pubkey`'s application `d` published, oldest first.
+    pub async fn flatpak_history(&self, pubkey: &str, d: &str) -> anyhow::Result<Vec<Published>> {
+        let (pubkey, d) = (pubkey.to_string(), d.to_string());
+        self.call(move |conn| {
+            conn.prepare(
+                "SELECT channel, ref, seq, checksum, source, version, timestamp, object FROM flatpak_history
+                 WHERE pubkey = ? AND d = ? ORDER BY channel, ref, seq",
+            )?
+            .query_map([pubkey, d], |row| {
+                Ok(Published {
+                    channel: row.get(0)?,
+                    ref_name: row.get(1)?,
+                    seq: row.get(2)?,
+                    commit: row.get(3)?,
+                    source: row.get(4)?,
+                    version: row.get(5)?,
+                    timestamp: row.get::<_, i64>(6)? as u64,
+                    object: row.get(7)?,
+                })
+            })?
+            .collect()
+        })
+        .await
+    }
+
+    /// Add `published` to the history. A place already taken is an error:
+    /// history is never rewritten.
+    pub async fn store_flatpak_history(&self, pubkey: &str, d: &str, published: Vec<Published>) -> anyhow::Result<()> {
+        let (pubkey, d) = (pubkey.to_string(), d.to_string());
+        self.call(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for row in published {
+                tx.execute(
+                    "INSERT INTO flatpak_history (pubkey, d, channel, ref, seq, checksum, source, version, timestamp, object)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        pubkey,
+                        d,
+                        row.channel,
+                        row.ref_name,
+                        row.seq,
+                        row.commit,
+                        row.source,
+                        row.version,
+                        row.timestamp as i64,
+                        row.object
+                    ],
+                )?;
+            }
+            tx.commit()
+        })
+        .await
     }
 
     /// The icon downloaded from `url`.

@@ -140,17 +140,39 @@ holding the newest commit of each app on it: the one from the release
 `/releases/…/latest` would pick, for each architecture. A `.flatpakref`
 (`/flatpak/<owner>/<d>/<anything>.flatpakref`, with `?channel=`) installs
 the app and adds the remote; a `.flatpakrepo` only adds the remote. The
-runtime an app needs comes from Flathub, which the `.flatpakref` names.
+runtime an app needs comes from the repository its bundle names (`flatpak
+build-bundle --runtime-repo=`), or else Flathub, which the `.flatpakref`
+names.
 
-Every commit any release lists is kept, so downgrades work; objects nothing
-needs any more are pruned once a day.
+A bundle is published the way Flathub publishes a build (`flatpak
+build-commit-from`): as a new commit, with the bundle's files and metadata,
+on top of the last one the channel published for the app, and signed by
+the gateway. So each remote has a history, which Flatpak can list and go
+back along:
+
+```sh
+flatpak remote-info --log buzz.armada.app buzz.armada.app   # every version, newest first
+flatpak update --commit=<commit> buzz.armada.app            # go back to one
+flatpak mask buzz.armada.app                                 # and stay there
+flatpak mask --remove buzz.armada.app && flatpak update      # back to the latest
+```
+
+The status page lists the same commits. A history is never rewritten: a
+release withdrawn puts the one before it back at the head as a new commit,
+dated after the last, which clients update to like any other (Flatpak
+refuses an update older than what's installed). Every commit any release
+lists is kept, so going back works; objects nothing needs any more are
+pruned once a day, so a withdrawn release stays in the history but can't be
+installed.
 
 Each remote also has AppStream branches (`appstream/<arch>` and
 `appstream2/<arch>`), made the way `flatpak build-update-repo` makes them,
 so GNOME Software, Discover and `flatpak search` show its apps with their
 names, descriptions and icons. They're made from the AppStream data
 `flatpak-builder` puts in each app, `files/share/app-info/`; an app built
-without it installs, but isn't listed.
+without it installs, but isn't listed. An app whose data lists no
+`<releases>` is given the releases the remote has a bundle of, so its
+version shows; one that lists its own keeps them.
 
 ## F-Droid
 

@@ -298,12 +298,20 @@ async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): 
         );
     }
     if !repo.bundles.is_empty() {
-        let _ = writeln!(out, "\nFlatpak:");
+        let _ = writeln!(out, "\nFlatpak, every commit each channel published, newest first:");
         for (rank, channel) in CHANNELS.iter().enumerate() {
-            for head in repo.flatpak(rank).map_or(&[][..], |channel| &channel.refs[..]) {
-                let _ = writeln!(out, "  {channel}: {} from {} ({})", head.bundle.ref_name, one_line(&head.release), head.bundle.commit);
+            let Some(remote) = repo.flatpak(rank) else { continue };
+            for head in &remote.refs {
+                let _ = writeln!(out, "  {channel}: {}", head.bundle.ref_name);
+                for published in remote.history.iter().rev().filter(|published| published.ref_name == head.bundle.ref_name) {
+                    let _ = writeln!(out, "    {} {}", one_line(&published.version), published.commit);
+                }
             }
         }
+        let _ = writeln!(
+            out,
+            "To go back to one: flatpak update --commit=<commit> <app id>. `flatpak remote-info --log <remote> <app id>` lists them too."
+        );
     }
     if !repo.rejections.is_empty() {
         let _ = writeln!(out, "\nLeft out:");
@@ -592,17 +600,19 @@ async fn flatpak_setup(
         return error(StatusCode::NOT_FOUND, format!("{} has no Flatpak app on the {channel} channel.", repo.name));
     };
     let parts: Vec<&str> = head.bundle.ref_name.split('/').collect();
+    let runtime_repo = head.bundle.runtime_repo.as_deref().unwrap_or(FLATHUB);
     text(
         "application/vnd.flatpak.ref",
         format!(
-            "[Flatpak Ref]\nTitle={title}\nName={}\nBranch={}\nUrl={url}\nSuggestRemoteName={remote_name}\nIsRuntime=false\nGPGKey={key}\nRuntimeRepo={FLATHUB}\n",
+            "[Flatpak Ref]\nTitle={title}\nName={}\nBranch={}\nUrl={url}\nSuggestRemoteName={remote_name}\nIsRuntime=false\nGPGKey={key}\nRuntimeRepo={runtime_repo}\n",
             parts[1], parts[3]
         ),
     )
 }
 
-/// Where the runtimes apps depend on come from: Flatpak adds it, if it isn't
-/// already, when it installs a `.flatpakref` naming it.
+/// Where the runtimes apps depend on come from, unless the bundle says:
+/// Flatpak adds it, if it isn't already, when it installs a `.flatpakref`
+/// naming it.
 const FLATHUB: &str = "https://dl.flathub.org/repo/flathub.flatpakrepo";
 
 /// A channel's remote's `config`, `summary` and `summary.sig`.
