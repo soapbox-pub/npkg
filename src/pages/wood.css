@@ -1,0 +1,122 @@
+/* Wood, paper and the crates made of them, flat and in 3D. */
+
+:root {
+  --ink: #2a1c10;
+  --ink-soft: #5b4430;
+  --paper: #f4e8cc;
+  --paper-edge: #e3cfa5;
+  --oak: #b9773a;
+  --oak-dark: #7a4719;
+  --walnut: #4a2a12;
+  --brass: #c9a24a;
+  --brass-dark: #8a6a22;
+  --stamp: #a8281d;
+  --amber: #ffc66b;
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='300'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.004 0.18' numOctaves='4' seed='3'/%3E%3CfeColorMatrix values='0 0 0 0 0.25 0 0 0 0 0.12 0 0 0 0 0.03 0 0 0 1.4 -0.45'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+  --fibres: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='p'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' seed='9'/%3E%3CfeColorMatrix values='0 0 0 0 0.4 0 0 0 0 0.3 0 0 0 0 0.15 0 0 0 0.35 -0.08'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23p)'/%3E%3C/svg%3E");
+  --planks: repeating-linear-gradient(180deg, transparent 0 44px, rgba(35, 16, 4, .55) 44px 46px, rgba(255, 220, 170, .14) 46px 47px);
+}
+
+.wood {
+  background: var(--planks), var(--grain), linear-gradient(180deg, #c98d4f, #a7672e);
+}
+
+.paper {
+  background: var(--fibres), radial-gradient(ellipse at 30% 0%, #fbf3df, var(--paper) 60%, var(--paper-edge));
+  color: var(--ink);
+  border-radius: 3px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .5) inset, 0 18px 30px -12px rgba(0, 0, 0, .6), 0 2px 4px rgba(0, 0, 0, .35);
+}
+
+/* A crate: boards around a paper label, nailed at the corners. */
+.crate {
+  position: relative;
+  padding: 16px;
+  border-radius: 4px;
+  background:
+    radial-gradient(circle at 9px 9px, #d8d2c4 0 2px, #4b4135 2.5px 3.5px, transparent 4px),
+    radial-gradient(circle at calc(100% - 9px) 9px, #d8d2c4 0 2px, #4b4135 2.5px 3.5px, transparent 4px),
+    radial-gradient(circle at 9px calc(100% - 9px), #d8d2c4 0 2px, #4b4135 2.5px 3.5px, transparent 4px),
+    radial-gradient(circle at calc(100% - 9px) calc(100% - 9px), #d8d2c4 0 2px, #4b4135 2.5px 3.5px, transparent 4px),
+    var(--planks), var(--grain), linear-gradient(180deg, #c98d4f, #a7672e);
+  box-shadow: inset 0 0 0 2px rgba(60, 28, 6, .7), inset 0 2px 0 4px rgba(255, 210, 150, .18), 0 22px 34px -14px rgba(0, 0, 0, .75), 0 3px 6px rgba(0, 0, 0, .4);
+}
+.crate > .label {
+  position: relative;
+  height: 100%;
+  padding: 22px 24px;
+  background: var(--fibres), linear-gradient(180deg, #fbf3df, var(--paper));
+  color: var(--ink);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(80, 50, 20, .35), 0 2px 6px rgba(40, 20, 5, .5);
+}
+
+.tilt {
+  --rx: 0deg;
+  --ry: 0deg;
+  transform: perspective(900px) rotateX(var(--rx)) rotateY(var(--ry));
+  transition: transform .25s ease-out;
+}
+.tilt:hover { transition-duration: .08s; }
+
+/* A crate in 3D: six faces, each boards with a brace across. */
+.scene {
+  --s: 200px;
+  width: var(--s);
+  height: var(--s);
+  perspective: calc(var(--s) * 5);
+  position: relative;
+}
+.cube {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  transform-style: preserve-3d;
+  animation: spin 22s linear infinite;
+}
+.cube .f {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(45deg, transparent 43%, rgba(60, 28, 6, .55) 43.5%, #9b5f28 44.5% 55.5%, rgba(60, 28, 6, .55) 56.5%, transparent 57%),
+    repeating-linear-gradient(180deg, transparent 0 calc(var(--s) / 5 - 2px), rgba(35, 16, 4, .6) calc(var(--s) / 5 - 2px) calc(var(--s) / 5)),
+    var(--grain), linear-gradient(180deg, #cf9455, #a8692f);
+  box-shadow: inset 0 0 0 calc(var(--s) * .085) #8d5523, inset 0 0 0 calc(var(--s) * .095) rgba(40, 18, 4, .7), inset 0 0 calc(var(--s) * .3) rgba(40, 18, 4, .35);
+}
+.cube .f span {
+  font: 900 calc(var(--s) * .2) / 1 "Rockwell", "Roboto Slab", "Zilla Slab", Georgia, serif;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: rgba(30, 14, 4, .78);
+  padding: .1em .3em;
+  background: rgba(240, 214, 170, .55);
+  border: 2px dashed rgba(30, 14, 4, .5);
+}
+.cube .f span.small { font-size: calc(var(--s) * .075); border-style: solid; color: var(--stamp); border-color: var(--stamp); background: rgba(240, 214, 170, .6); }
+.cube .front { transform: translateZ(calc(var(--s) / 2)); }
+.cube .back { transform: rotateY(180deg) translateZ(calc(var(--s) / 2)); }
+.cube .right { transform: rotateY(90deg) translateZ(calc(var(--s) / 2)); filter: brightness(.82); }
+.cube .left { transform: rotateY(-90deg) translateZ(calc(var(--s) / 2)); filter: brightness(.82); }
+.cube .top { transform: rotateX(90deg) translateZ(calc(var(--s) / 2)); filter: brightness(1.12); }
+.cube .bottom { transform: rotateX(-90deg) translateZ(calc(var(--s) / 2)); filter: brightness(.55); }
+
+@keyframes spin {
+  from { transform: rotateX(-20deg) rotateY(0deg); }
+  to { transform: rotateX(-20deg) rotateY(360deg); }
+}
+@keyframes bob {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -14px; }
+}
+@keyframes sway {
+  0%, 100% { transform: rotateX(-14deg) rotateY(-28deg) rotateZ(-4deg); }
+  50% { transform: rotateX(-24deg) rotateY(-46deg) rotateZ(3deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cube, .scene { animation: none !important; }
+  .cube { transform: rotateX(-20deg) rotateY(-32deg); }
+  .tilt { transform: none; transition: none; }
+}

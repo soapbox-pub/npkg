@@ -77,6 +77,9 @@ pub struct Rejection {
     /// The version of the NIP-82 release it came from.
     pub release: String,
     pub sha256: String,
+    /// The asset's media type, so each kind of repository lists only its
+    /// own; empty for a whole release left out.
+    pub mime: String,
     pub reason: String,
 }
 
@@ -109,8 +112,6 @@ pub struct FdroidRepo {
     pub fingerprint: String,
     pub address: String,
     files: HashMap<String, Vec<u8>>,
-    /// The name the index gives the app's icon, and the icon.
-    pub icon: Option<(String, Vec<u8>)>,
 }
 
 impl FdroidRepo {
@@ -138,6 +139,8 @@ pub struct Repo {
     pub d: String,
     pub name: String,
     pub summary: Option<String>,
+    /// The application's icon, named `icon-<sha256>`.
+    pub icon: Option<(String, Vec<u8>)>,
     pub packages: Vec<Package>,
     pub rejections: Vec<Rejection>,
     /// Highest version first.
@@ -351,6 +354,7 @@ impl Repos {
                 rejections.push(Rejection {
                     release: release.version.clone(),
                     sha256: String::new(),
+                    mime: String::new(),
                     reason: format!(
                         "The release's channel, {:?}, isn't one of NIP-82's: {}.",
                         release.channel,
@@ -402,7 +406,12 @@ impl Repos {
         let mut candidates = Vec::new();
         let mut incomplete = false;
         for (release, channel, asset, result) in inspected {
-            let reject = |reason: String| Rejection { release: release.version.clone(), sha256: asset.sha256.clone(), reason };
+            let reject = |reason: String| Rejection {
+                release: release.version.clone(),
+                sha256: asset.sha256.clone(),
+                mime: asset.mime.clone(),
+                reason,
+            };
             match result.map(|inspected| (inspected.meta, inspected.size, inspected.url)) {
                 Ok((Ok(meta), size, url)) => candidates.push(Package {
                     release: release.version.clone(),
@@ -431,7 +440,12 @@ impl Repos {
             .await;
         let mut bundles = Vec::new();
         for (release, asset, result) in unpacked {
-            let reject = |reason: String| Rejection { release: release.version.clone(), sha256: asset.sha256.clone(), reason };
+            let reject = |reason: String| Rejection {
+                release: release.version.clone(),
+                sha256: asset.sha256.clone(),
+                mime: asset.mime.clone(),
+                reason,
+            };
             match result {
                 Ok(Ok(bundle)) => bundles.push(FlatpakBundle {
                     release: release.version.clone(),
@@ -466,6 +480,7 @@ impl Repos {
             rejections.push(Rejection {
                 release: candidate.release.clone(),
                 sha256: candidate.sha256.clone(),
+                mime: format.mime().to_string(),
                 reason: format!("{key} is served from an earlier file, {pinned}. The first file published for a package version stays."),
             });
             // The pinned file is served even once no release lists it, in the
@@ -497,9 +512,9 @@ impl Repos {
         let description = format!("{name}, published on Nostr by {}", nip19::npub_encode(pubkey));
         let address = format!("{}/fdroid/{}/{}/repo", self.public_url, nip19::npub_encode(pubkey), crate::http::segment(d));
         let last_index = self.db.fdroid_index(pubkey, d).await?;
-        let has_apks = packages.iter().any(|package| package.meta.format() == Format::Apk);
         let icon_url = snapshot.application.as_ref().and_then(|app| app.icon.clone());
-        let icon = match icon_url.filter(|_| has_apks) {
+        // Shown on its pages, and named in its F-Droid index.
+        let icon = match icon_url {
             Some(url) => match self.icon(&url, offline).await {
                 Ok(icon) => icon,
                 Err(error) => {
@@ -511,6 +526,7 @@ impl Repos {
             },
             None => None,
         };
+        let icon = icon.map(|data| (format!("icon-{}", hex::encode(Sha256::digest(&data))), data));
         let mut history = self.db.flatpak_history(pubkey, d).await?;
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let store = self.store.clone();
@@ -553,7 +569,6 @@ impl Repos {
             let fdroid = (!apks.is_empty()).then(|| {
                 let key = fdroid::Key::derive(&signer, &pubkey, &d);
                 let application = snapshot.application.as_ref();
-                let icon = icon.map(|data| (format!("icon-{}", hex::encode(Sha256::digest(&data))), data));
                 let icon_file = icon.as_ref().map(|(name, data)| fdroid::File {
                     name: format!("/{name}"),
                     sha256: name["icon-".len()..].to_string(),
@@ -582,7 +597,7 @@ impl Repos {
                 let count = apks.iter().map(|package| package.meta.name()).collect::<HashSet<_>>().len();
                 let files = fdroid::render(&key, &pubkey, &d, index, count, timestamp);
                 let dated = changed.then_some((content, timestamp));
-                (FdroidRepo { fingerprint: key.fingerprint(), address: address.clone(), files, icon }, dated)
+                (FdroidRepo { fingerprint: key.fingerprint(), address: address.clone(), files }, dated)
             });
             let mut commitmeta = HashMap::new();
             let mut objects = HashSet::new();
@@ -620,6 +635,7 @@ impl Repos {
                 d,
                 name,
                 summary,
+                icon,
                 packages,
                 rejections,
                 releases,
@@ -956,7 +972,8 @@ fn select(candidates: Vec<Package>) -> (Vec<Package>, Vec<Rejection>) {
     let mut chosen: HashMap<String, Package> = HashMap::new();
     for candidate in candidates {
         if let Some(reason) = unlistable(&candidate.meta) {
-            rejections.push(Rejection { release: candidate.release, sha256: candidate.sha256, reason });
+            let mime = candidate.meta.format().mime().to_string();
+            rejections.push(Rejection { release: candidate.release, sha256: candidate.sha256, mime, reason });
             continue;
         }
         match chosen.get(&candidate.sha256) {
@@ -998,7 +1015,7 @@ fn unlistable(meta: &Meta) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::inspect::deb::parse_control;
 
@@ -1103,7 +1120,7 @@ mod tests {
 
     /// The fixture .deb, inspected into `db`, and a snapshot of one release
     /// listing it and a file never seen before.
-    async fn hello(db: &Db) -> nip82::Snapshot {
+    pub async fn hello(db: &Db) -> nip82::Snapshot {
         let bytes = include_bytes!("../tests/fixtures/hello_1.2.0-rc.1_amd64.deb");
         let sha256 = hex::encode(Sha256::digest(bytes));
         let url = "https://example.com/hello.deb".to_string();

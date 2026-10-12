@@ -27,6 +27,14 @@ impl Format {
         }
     }
 
+    pub fn mime(self) -> &'static str {
+        match self {
+            Format::Deb => crate::nip82::DEB_MIME,
+            Format::Rpm => crate::nip82::RPM_MIME,
+            Format::Apk => crate::nip82::APK_MIME,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Format::Deb => "deb",

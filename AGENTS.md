@@ -22,8 +22,11 @@ src/
   config.rs      the TOML config file (npkg.example.toml)
   sync.rs        the sync worker: builds at startup from stored events,
                  follows the team live, resyncs every resync_interval
-  http.rs        the routes, setup files, the status page, and release JSON
-                 and downloads (/releases/<owner>/<d>); the client's address
+  http.rs        the routes, setup files, and release JSON and downloads
+                 (/releases/<owner>/<d>); the client's address
+  pages/         the HTML pages: the front page, one per kind of
+                 repository, errors; their CSS, script and icon are
+                 compiled in, under a strict Content-Security-Policy
   repo.rs        building a repository: inspect, select, pin, render; the
                  built ones, which requests read
   nip82.rs       reading applications, releases and assets from events

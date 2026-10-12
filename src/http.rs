@@ -11,7 +11,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -27,12 +26,12 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::inspect::Format;
-use crate::nip82::one_line;
 use crate::nostr::nip05::{self, Address, Resolver};
 use crate::nostr::nip19;
 use crate::ostree;
+use crate::pages::{self, Kind};
 use crate::repo::{CHANNELS, FlatpakChannel, Lookup, Release, Repo, Repos, channel_rank};
-use crate::{apt, fdroid, nip82};
+use crate::{apt, nip82};
 
 pub struct AppState {
     pub repos: Arc<Repos>,
@@ -49,20 +48,22 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/key.asc", get(key))
-        .route("/apt/{owner}/{d}", get(status))
+        .route("/assets/{file}", get(asset))
+        .route("/icon/{owner}/{d}/{file}", get(icon))
+        .route("/apt/{owner}/{d}", get(apt_page))
         .route("/apt/{owner}/{d}/source", get(apt_source))
         .route("/apt/{owner}/{d}/dists/{suite}/{*path}", get(apt_dists))
         .route("/apt/{owner}/{d}/pool/{sha256}/{file}", get(apt_pool))
-        .route("/rpm/{owner}/{d}", get(status))
+        .route("/rpm/{owner}/{d}", get(rpm_page))
         .route("/rpm/{owner}/{d}/repo", get(rpm_repo))
         .route("/rpm/{owner}/{d}/{channel}/repodata/{file}", get(rpm_repodata))
         .route("/rpm/{owner}/{d}/{channel}/packages/{sha256}/{file}", get(rpm_package))
-        .route("/flatpak/{owner}/{d}", get(status))
+        .route("/flatpak/{owner}/{d}", get(flatpak_page))
         .route("/flatpak/{owner}/{d}/{file}", get(flatpak_setup))
         .route("/flatpak/{owner}/{d}/{channel}/{file}", get(flatpak_top))
         .route("/flatpak/{owner}/{d}/{channel}/objects/{prefix}/{file}", get(flatpak_object))
-        .route("/fdroid/{owner}/{d}", get(status))
-        .route("/fdroid/{owner}/{d}/repo", get(status))
+        .route("/fdroid/{owner}/{d}", get(fdroid_page))
+        .route("/fdroid/{owner}/{d}/repo", get(fdroid_page))
         .route("/fdroid/{owner}/{d}/repo/{file}", get(fdroid_file))
         .route("/fdroid/{owner}/{d}/repo/{sha256}/{file}", get(fdroid_apk))
         .route("/releases/{owner}/{d}", get(releases))
@@ -187,139 +188,124 @@ async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> R
 }
 
 async fn index(State(state): Shared) -> Response {
-    let base = &state.public_url;
-    let mut out = format!(
-        "npkg: apt, dnf, Flatpak and F-Droid repositories for software its team releases on Nostr (NIP-82).\n\n\
-         apt:  {base}/apt/<owner>/<app-id>\n\
-         dnf:  {base}/rpm/<owner>/<app-id>\n\
-         F-Droid:  {base}/fdroid/<owner>/<app-id>\n\
-         releases, as JSON:  {base}/releases/<owner>/<app-id>, and /latest\n\
-         a release's file:   {base}/releases/<owner>/<app-id>/latest/download/<filename>\n\
-         The owner is an npub, or a NIP-05 address: alex@gleasonator.com, or soapbox.pub for _@soapbox.pub.\n\n\
-         key:  {base}/key.asc ({})\n\nRepositories:\n",
-        state.repos.signer().fingerprint()
-    );
-    let repos = state.repos.all();
-    if repos.is_empty() {
-        let _ = writeln!(out, "  none yet");
-    }
-    for repo in repos {
-        let _ = writeln!(out, "  {} ({}): {base}/apt/{}/{}", repo.name, repo.d, nip19::npub_encode(&repo.pubkey), segment(&repo.d));
-    }
-    text("text/plain; charset=utf-8", out)
+    let fingerprint = state.repos.signer().fingerprint();
+    let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
+    html(StatusCode::OK, pages::index(&site, &state.repos.all()))
 }
 
 async fn key(State(state): Shared) -> Response {
     text("application/pgp-keys", state.repos.signer().public_key().to_string())
 }
 
-/// What a repository holds, what it left out and why, and how to add it.
-async fn status(State(state): Shared, Client(client): Client, Path((owner, d)): Path<(String, String)>) -> Response {
-    let (repo, owner) = match repo(&state, client, &owner, &d).await {
+/// A page, with nothing in it the gateway didn't serve itself.
+fn html(status: StatusCode, body: String) -> Response {
+    let mut response =
+        (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=60")], body).into_response();
+    response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(pages::CSP));
+    response
+}
+
+/// An error made for apt or dnf, as a page: the same status and headers,
+/// its sentence on a crate.
+async fn html_error(state: &AppState, response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let message = axum::body::to_bytes(body, 64 << 10).await.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default();
+    let fingerprint = state.repos.signer().fingerprint();
+    let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
+    let reason = parts.status.canonical_reason().unwrap_or("Error");
+    let mut page = html(parts.status, pages::error(&site, parts.status.as_u16(), reason, &message));
+    if let Some(retry) = parts.headers.get(header::RETRY_AFTER) {
+        page.headers_mut().insert(header::RETRY_AFTER, retry.clone());
+    }
+    page.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    page
+}
+
+/// The stylesheet, script and icon the pages use.
+async fn asset(Path(file): Path<String>) -> Response {
+    let (content_type, body) = match file.as_str() {
+        "style.css" => ("text/css; charset=utf-8", pages::STYLE),
+        "app.js" => ("text/javascript; charset=utf-8", pages::SCRIPT),
+        "favicon.svg" => ("image/svg+xml", pages::FAVICON),
+        _ => return error(StatusCode::NOT_FOUND, "There's no such file."),
+    };
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=300")], body).into_response()
+}
+
+/// An application's icon, named by its hash, as its pages show it.
+async fn icon(State(state): Shared, Client(client): Client, Path((owner, d, file)): Path<(String, String, String)>) -> Response {
+    match repo(&state, client, &owner, &d).await {
+        Ok((repo, _)) => icon_file(&repo, &file).unwrap_or_else(|| error(StatusCode::NOT_FOUND, "There's no such icon.")),
+        Err(response) => response,
+    }
+}
+
+/// The application's icon, if it's called `file`.
+fn icon_file(repo: &Repo, file: &str) -> Option<Response> {
+    let (_, icon) = repo.icon.as_ref().filter(|(name, _)| name == file)?;
+    let content_type = match icon.as_slice() {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        // Not one a page shows: an SVG could carry script.
+        _ => "application/octet-stream",
+    };
+    // Named by its hash, so it never changes.
+    Some(
+        ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], icon.clone())
+            .into_response(),
+    )
+}
+
+async fn apt_page(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    repo_page(&state, client, &owner, &d, &query, Kind::Apt).await
+}
+
+async fn rpm_page(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    repo_page(&state, client, &owner, &d, &query, Kind::Rpm).await
+}
+
+async fn flatpak_page(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    repo_page(&state, client, &owner, &d, &query, Kind::Flatpak).await
+}
+
+async fn fdroid_page(
+    State(state): Shared,
+    Client(client): Client,
+    Path((owner, d)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    repo_page(&state, client, &owner, &d, &query, Kind::Fdroid).await
+}
+
+/// What one kind of repository holds, how to add it, and what it left out.
+async fn repo_page(state: &AppState, client: IpAddr, owner: &str, d: &str, query: &HashMap<String, String>, kind: Kind) -> Response {
+    let (repo, owner) = match repo(state, client, owner, d).await {
         Ok(found) => found,
-        Err(response) => return response,
+        Err(response) => return html_error(state, response).await,
     };
-    let base = &state.public_url;
-    let file = file_stem(&repo.d);
-    let mut out = format!("{} ({})\n", repo.name, repo.d);
-    if let Some(summary) = &repo.summary {
-        let _ = writeln!(out, "{summary}");
-    }
-    out.push('\n');
-
-    let names = |format: Format| {
-        let mut names: Vec<&str> =
-            repo.packages.iter().filter(|package| package.meta.format() == format).map(|package| package.meta.name()).collect();
-        names.sort();
-        names.dedup();
-        names.join(" ")
+    let rank = match setup_channel(query) {
+        Ok(channel) => channel_rank(channel).unwrap_or(0),
+        Err(response) => return html_error(state, response).await,
     };
-    let (debs, rpms) = (names(Format::Deb), names(Format::Rpm));
-    if !debs.is_empty() {
-        let _ = writeln!(
-            out,
-            "Debian, Ubuntu:\n  sudo curl -fsSL -o /etc/apt/sources.list.d/{file}.sources {base}/apt/{owner}/{d}/source\n  sudo apt update && sudo apt install {debs}\n",
-            d = segment(&repo.d)
-        );
-    }
-    if !rpms.is_empty() {
-        let _ = writeln!(
-            out,
-            "Fedora, RHEL:\n  sudo curl -fsSL -o /etc/yum.repos.d/{file}.repo {base}/rpm/{owner}/{d}/repo\n  sudo dnf install {rpms}\n",
-            d = segment(&repo.d)
-        );
-    }
-    if let Some(app) =
-        repo.flatpak(0).or_else(|| (1..CHANNELS.len()).find_map(|rank| repo.flatpak(rank))).and_then(|channel| flatpak_app(&repo, channel))
-    {
-        let _ = writeln!(
-            out,
-            "Flatpak:\n  flatpak install --user {base}/flatpak/{owner}/{d}/{file}.flatpakref\n  flatpak run {app}\n",
-            d = segment(&repo.d)
-        );
-    }
-    if let Some(fdroid) = &repo.fdroid {
-        let _ = writeln!(
-            out,
-            "F-Droid (in Settings, Repositories, or open the link on the phone):\n  {}\n  fingerprint {}\n  Releases off the stable channel are in F-Droid's Beta channel.\n",
-            fdroid::setup_url(&fdroid.address, &fdroid.fingerprint),
-            fdroid.fingerprint
-        );
-    }
-    let _ = writeln!(out, "Channels: {} (add ?channel=beta to any setup URL)", CHANNELS.join(", "));
-    let _ = writeln!(out, "This repository serves whatever packages its author publishes, under any name.\n");
-    let _ = writeln!(
-        out,
-        "Releases, as JSON: {base}/releases/{owner}/{d}\nThe latest release's files: {base}/releases/{owner}/{d}/latest/download/<filename>\n",
-        d = segment(&repo.d)
-    );
-
-    let _ = writeln!(out, "Packages:");
-    if repo.packages.is_empty() {
-        let _ = writeln!(out, "  none");
-    }
-    let mut packages: Vec<_> = repo.packages.iter().collect();
-    packages.sort_by_key(|package| (package.meta.name(), package.meta.format(), std::cmp::Reverse(package.created_at)));
-    let mut previous = None;
-    for package in packages {
-        let name = package.meta.name();
-        if previous != Some(name) {
-            let _ = writeln!(out, "  {}", one_line(name));
-            previous = Some(name);
-        }
-        let _ = writeln!(
-            out,
-            "    {} {} {} [{}] {}",
-            one_line(&package.meta.version()),
-            package.meta.format().as_str(),
-            one_line(&package.meta.arch()),
-            CHANNELS[package.channel],
-            package.sha256
-        );
-    }
-    if !repo.bundles.is_empty() {
-        let _ = writeln!(out, "\nFlatpak, every commit each channel published, newest first:");
-        for (rank, channel) in CHANNELS.iter().enumerate() {
-            let Some(remote) = repo.flatpak(rank) else { continue };
-            for head in &remote.refs {
-                let _ = writeln!(out, "  {channel}: {}", head.bundle.ref_name);
-                for published in remote.history.iter().rev().filter(|published| published.ref_name == head.bundle.ref_name) {
-                    let _ = writeln!(out, "    {} {}", one_line(&published.version), published.commit);
-                }
-            }
-        }
-        let _ = writeln!(
-            out,
-            "To go back to one: flatpak update --commit=<commit> <app id>. `flatpak remote-info --log <remote> <app id>` lists them too."
-        );
-    }
-    if !repo.rejections.is_empty() {
-        let _ = writeln!(out, "\nLeft out:");
-        for rejection in &repo.rejections {
-            let _ = writeln!(out, "  {} {}: {}", one_line(&rejection.release), rejection.sha256, one_line(&rejection.reason));
-        }
-    }
-    text("text/plain; charset=utf-8", out)
+    let fingerprint = state.repos.signer().fingerprint();
+    let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
+    html(StatusCode::OK, pages::repo(&site, &repo, &owner, kind, rank))
 }
 
 /// `d`, as one segment of a URL path.
@@ -331,7 +317,7 @@ pub fn segment(d: &str) -> String {
 
 /// `d`, as a file name apt and dnf read: they skip files with other
 /// characters in their names.
-fn file_stem(d: &str) -> String {
+pub fn file_stem(d: &str) -> String {
     d.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect()
 }
 
@@ -490,16 +476,8 @@ async fn fdroid_file(State(state): Shared, Client(client): Client, Path((owner, 
     let Some(fdroid) = &repo.fdroid else {
         return error(StatusCode::NOT_FOUND, format!("{} has no APK in any release.", repo.name));
     };
-    if let Some((_, icon)) = fdroid.icon.as_ref().filter(|(name, _)| *name == file) {
-        let content_type = match icon.as_slice() {
-            [0x89, b'P', b'N', b'G', ..] => "image/png",
-            [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-            [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
-            _ => "application/octet-stream",
-        };
-        // Named by its hash, so it never changes.
-        return ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], icon.clone())
-            .into_response();
+    if let Some(icon) = icon_file(&repo, &file) {
+        return icon;
     }
     let content_type = match file.as_str() {
         "entry.jar" => "application/java-archive",
@@ -554,7 +532,7 @@ fn passed_on(upstream: reqwest::Response) -> Response {
 
 /// The app a channel's `.flatpakref` installs: the one named like the
 /// repository if there is one, or else the first. Its id, and its branch.
-fn flatpak_app<'a>(repo: &Repo, channel: &'a FlatpakChannel) -> Option<&'a str> {
+pub fn flatpak_app<'a>(repo: &Repo, channel: &'a FlatpakChannel) -> Option<&'a str> {
     let app_id = |head: &'a crate::repo::FlatpakBundle| head.bundle.ref_name.split('/').nth(1);
     channel.refs.iter().find(|head| app_id(head) == Some(repo.d.as_str())).or(channel.refs.first()).and_then(app_id)
 }

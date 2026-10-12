@@ -17,6 +17,7 @@ mod net;
 mod nip82;
 mod nostr;
 mod ostree;
+mod pages;
 mod rate_limit;
 mod repo;
 mod rpmmd;

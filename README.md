@@ -18,8 +18,11 @@ The owner is the author's npub, or a NIP-05 address that names them:
 `alex@gleasonator.com`, or a bare domain like `soapbox.pub` for
 `_@soapbox.pub`. Setup files keep whichever form they were asked for by.
 
-Opening either path shows the repository's packages, the files it left out
-and why, and how to add it:
+Opening any of these in a browser shows a page for that kind of
+repository only: how to add it, with commands to copy, its packages, and
+the files it left out and why. The F-Droid page has a QR code to scan, and
+the Flatpak page every version, to go back to. A tool asking for the same
+path gets what it reads instead. Adding them looks like this:
 
 ```sh
 # Debian, Ubuntu
@@ -43,7 +46,8 @@ For F-Droid, add the repository URL the status page gives, which has the
 repository's fingerprint in it, in Settings, Repositories.
 
 Add `?channel=beta` (or `nightly`, `dev`) to a setup URL to follow a
-less stable channel. The gateway's front page lists every repository.
+less stable channel. The gateway's front page lists every application, and the kinds of
+repository each has.
 
 ## How it stays current
 
