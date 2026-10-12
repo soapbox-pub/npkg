@@ -219,6 +219,7 @@ pub struct About<'a> {
     pub description: &'a str,
     pub application: Option<&'a Application>,
     pub icon: Option<&'a File>,
+    pub screenshots: &'a [File],
 }
 
 /// A file F-Droid fetches from the repository, by its path below it.
@@ -226,6 +227,43 @@ pub struct File {
     pub name: String,
     pub sha256: String,
     pub size: u64,
+}
+
+fn file(file: &File) -> Value {
+    json!({"name": file.name, "sha256": file.sha256, "size": file.size})
+}
+
+/// The most categories an application is put in.
+const MAX_CATEGORIES: usize = 8;
+
+/// The application's categories, from its `t` tags: each an id, and the
+/// name F-Droid shows, capitalized. A tag that isn't a short word or two is
+/// left out.
+fn categories(app: &Application) -> Vec<(String, String)> {
+    let mut categories: Vec<(String, String)> = Vec::new();
+    for topic in &app.topics {
+        let id = topic.trim().to_lowercase();
+        if id.is_empty() || id.len() > 32 || !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ' ') {
+            continue;
+        }
+        if categories.iter().any(|(other, _)| *other == id) {
+            continue;
+        }
+        let name = id
+            .split(['-', ' '])
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map(|first| first.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        categories.push((id, name));
+        if categories.len() == MAX_CATEGORIES {
+            break;
+        }
+    }
+    categories
 }
 
 fn localized(text: &str) -> Value {
@@ -307,20 +345,37 @@ pub fn index(about: &About, packages: &[&Package], releases: &[Release], timesta
                 metadata["license"] = json!(license);
             }
             if let Some(icon) = about.icon {
-                metadata["icon"] = json!({ LOCALE: {"name": icon.name, "sha256": icon.sha256, "size": icon.size} });
+                metadata["icon"] = json!({ LOCALE: file(icon) });
+            }
+            if !about.screenshots.is_empty() {
+                metadata["screenshots"] = json!({"phone": { LOCALE: about.screenshots.iter().map(file).collect::<Vec<_>>() }});
+            }
+            let categories = categories(app);
+            if !categories.is_empty() {
+                metadata["categories"] = json!(categories.iter().map(|(id, _)| id).collect::<Vec<_>>());
             }
         }
         index_packages.insert(name.to_string(), json!({"metadata": metadata, "versions": versions}));
     }
-    let index = json!({
-        "repo": {
-            "name": localized(about.name),
-            "description": localized(about.description),
-            "address": about.address,
-            "timestamp": timestamp,
-        },
-        "packages": index_packages,
+    let mut repo = json!({
+        "name": localized(about.name),
+        "description": localized(about.description),
+        "address": about.address,
+        "timestamp": timestamp,
     });
+    // The repository is the application's own, so it wears its icon.
+    if let Some(icon) = about.icon {
+        repo["icon"] = json!({ LOCALE: file(icon) });
+    }
+    // F-Droid only shows a category the repository defines.
+    if let Some(app) = about.application {
+        let defined: serde_json::Map<String, Value> =
+            categories(app).into_iter().map(|(id, name)| (id, json!({"name": localized(&name)}))).collect();
+        if !defined.is_empty() {
+            repo["categories"] = Value::Object(defined);
+        }
+    }
+    let index = json!({"repo": repo, "packages": index_packages});
     serde_json::to_vec(&index).unwrap_or_default()
 }
 

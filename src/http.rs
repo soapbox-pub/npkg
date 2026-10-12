@@ -282,16 +282,11 @@ async fn icon(State(state): Shared, Client(client): Client, Path((owner, d, file
     }
 }
 
-/// The application's icon, if it's called `file`.
+/// The application's icon or one of its screenshots, if it's called `file`.
 fn icon_file(repo: &Repo, file: &str) -> Option<Response> {
-    let (_, icon) = repo.icon.as_ref().filter(|(name, _)| name == file)?;
-    let content_type = match icon.as_slice() {
-        [0x89, b'P', b'N', b'G', ..] => "image/png",
-        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
-        // Not one a page shows: an SVG could carry script.
-        _ => "application/octet-stream",
-    };
+    let (_, icon) = repo.icon.iter().chain(&repo.screenshots).find(|(name, _)| name == file)?;
+    // Anything else isn't one a page shows: an SVG could carry script.
+    let content_type = crate::repo::image_type(icon).unwrap_or("application/octet-stream");
     // Named by its hash, so it never changes.
     Some(
         ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], icon.clone())

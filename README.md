@@ -187,7 +187,10 @@ listed in an F-Droid repository (index v2) at `/fdroid/<owner>/<d>/repo`,
 under the package names the APKs give, with what their manifests say:
 version, SDK versions, permissions, ABIs and signer. The application's
 name, summary, description, icon, website and license come from its NIP-82
-event.
+event, and so do its screenshots (`image` tags, up to 16, PNG, JPEG or
+WebP, 4 MB each) and its categories (`t` tags). The repository wears the
+application's icon. Images are downloaded once, kept, and served from the
+repository under their hashes, since F-Droid checks them against the index.
 
 F-Droid knows a repository by the key that signs it, so each application
 has a key of its own: adding one trusts that application's author, not the

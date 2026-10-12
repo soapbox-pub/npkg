@@ -50,6 +50,10 @@ const DOWNLOADS: usize = 4;
 /// The largest icon downloaded for F-Droid.
 const MAX_ICON: u64 = 1 << 20;
 
+/// The largest screenshot downloaded for F-Droid, and the most of them.
+const MAX_SCREENSHOT: u64 = 4 << 20;
+const MAX_SCREENSHOTS: usize = 16;
+
 /// The most package files one repository considers.
 const MAX_CANDIDATES: usize = 500;
 
@@ -141,6 +145,8 @@ pub struct Repo {
     pub summary: Option<String>,
     /// The application's icon, named `icon-<sha256>`.
     pub icon: Option<(String, Vec<u8>)>,
+    /// Its screenshots, for F-Droid, named `screenshot-<sha256>`.
+    pub screenshots: Vec<(String, Vec<u8>)>,
     /// The image link previews show of it, a JPEG, named by its hash.
     pub card: Option<(String, Vec<u8>)>,
     pub packages: Vec<Package>,
@@ -517,7 +523,7 @@ impl Repos {
         let icon_url = snapshot.application.as_ref().and_then(|app| app.icon.clone());
         // Shown on its pages, and named in its F-Droid index.
         let icon = match icon_url {
-            Some(url) => match self.icon(&url, offline).await {
+            Some(url) => match self.image(&url, MAX_ICON, offline).await {
                 Ok(icon) => icon,
                 Err(error) => {
                     // Shown without it, and tried again next time.
@@ -529,6 +535,25 @@ impl Repos {
             None => None,
         };
         let icon = icon.map(|data| (format!("icon-{}", hex::encode(Sha256::digest(&data))), data));
+        // Only F-Droid shows them, so they're only fetched for APKs.
+        let mut screenshots = Vec::new();
+        let has_apks = packages.iter().any(|package| package.meta.format() == Format::Apk);
+        let images = snapshot.application.as_ref().filter(|_| has_apks).map_or(&[][..], |app| &app.images[..]);
+        for url in images.iter().take(MAX_SCREENSHOTS) {
+            match self.image(url, MAX_SCREENSHOT, offline).await {
+                Ok(Some(data)) if image_type(&data).is_some() => {
+                    let name = format!("screenshot-{}", hex::encode(Sha256::digest(&data)));
+                    if !screenshots.iter().any(|(other, _)| *other == name) {
+                        screenshots.push((name, data));
+                    }
+                }
+                Ok(_) => tracing::info!(pubkey, d, url, "screenshot left out: not a PNG, JPEG or WebP at a public address"),
+                Err(error) => {
+                    tracing::info!(pubkey, d, url, error = format!("{error:#}"), "screenshot left out");
+                    incomplete = true;
+                }
+            }
+        }
         let mut history = self.db.flatpak_history(pubkey, d).await?;
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let store = self.store.clone();
@@ -572,11 +597,13 @@ impl Repos {
             let fdroid = (!apks.is_empty()).then(|| {
                 let key = fdroid::Key::derive(&signer, &pubkey, &d);
                 let application = snapshot.application.as_ref();
-                let icon_file = icon.as_ref().map(|(name, data)| fdroid::File {
+                let file = |(name, data): &(String, Vec<u8>)| fdroid::File {
                     name: format!("/{name}"),
-                    sha256: name["icon-".len()..].to_string(),
+                    sha256: hex::encode(Sha256::digest(data)),
                     size: data.len() as u64,
-                });
+                };
+                let icon_file = icon.as_ref().map(file);
+                let screenshot_files: Vec<fdroid::File> = screenshots.iter().map(file).collect();
                 let about = fdroid::About {
                     address: &address,
                     d: &d,
@@ -584,6 +611,7 @@ impl Repos {
                     description: &description,
                     application,
                     icon: icon_file.as_ref(),
+                    screenshots: &screenshot_files,
                 };
                 // F-Droid only reads an index dated later than the last one
                 // it read, so a changed index is dated later than the last,
@@ -639,6 +667,7 @@ impl Repos {
                 name,
                 summary,
                 icon,
+                screenshots,
                 card: None,
                 packages,
                 rejections,
@@ -789,23 +818,23 @@ impl Repos {
         self.fetch_first(&urls, range).await
     }
 
-    /// The icon at `url`, from the database, or downloaded. `None` if
-    /// it's not at a URL the gateway fetches from. Kept by URL: an icon on
-    /// Blossom is named by its hash, so a new one has a new URL.
-    async fn icon(&self, url: &str, offline: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    /// The icon or screenshot at `url`, from the database, or downloaded.
+    /// `None` if it's not at a URL the gateway fetches from. Kept by URL: an
+    /// image on Blossom is named by its hash, so a new one has a new URL.
+    async fn image(&self, url: &str, max: u64, offline: bool) -> anyhow::Result<Option<Vec<u8>>> {
         if !reqwest::Url::parse(url).is_ok_and(|url| net::is_public_url(&url)) {
             return Ok(None);
         }
         if let Some(icon) = self.db.icon(url).await? {
             return Ok(Some(icon));
         }
-        anyhow::ensure!(!offline, "The icon isn't downloaded yet.");
+        anyhow::ensure!(!offline, "The image isn't downloaded yet.");
         let response = self.http.get(url).send().await?.error_for_status()?;
         let mut stream = response.bytes_stream();
         let mut icon = Vec::new();
         while let Some(chunk) = stream.next().await {
             icon.extend_from_slice(&chunk?);
-            anyhow::ensure!(icon.len() as u64 <= MAX_ICON, "The icon at {url} is larger than {MAX_ICON} bytes.");
+            anyhow::ensure!(icon.len() as u64 <= max, "The image at {url} is larger than {max} bytes.");
         }
         self.db.store_icon(url, &icon).await?;
         Ok(Some(icon))
@@ -965,6 +994,16 @@ fn app_releases(releases: &[Release], bundles: &[FlatpakBundle], rank: usize, re
         }
     }
     listed
+}
+
+/// The media type of a PNG, JPEG or WebP, by its first bytes.
+pub fn image_type(data: &[u8]) -> Option<&'static str> {
+    match data {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
 }
 
 /// A package version, as apt and dnf tell one from another: name, version
@@ -1370,8 +1409,21 @@ pub mod tests {
             size: None,
             platforms: Vec::new(),
         };
+        // An icon, a screenshot, one that isn't an image, and topics.
+        let png = b"\x89PNG\r\n\x1a\nsome pixels".to_vec();
+        db.store_icon("https://example.com/icon.png", &png).await.unwrap();
+        db.store_icon("https://example.com/shot.png", &png).await.unwrap();
+        db.store_icon("https://example.com/shot.svg", b"<svg/>").await.unwrap();
+        let application = nip82::Application {
+            name: Some("Hello".into()),
+            icon: Some("https://example.com/icon.png".into()),
+            images: vec!["https://example.com/shot.png".into(), "https://example.com/shot.svg".into()],
+            topics: vec!["nostr".into(), "Social-Media".into(), "nostr".into(), "<b>".into()],
+            created_at: 50,
+            ..Default::default()
+        };
         let mut snapshot = nip82::Snapshot {
-            application: Some(nip82::Application { name: Some("Hello".into()), created_at: 50, ..Default::default() }),
+            application: Some(application),
             releases: vec![nip82::Release {
                 version: "1.2.3-rc.1".into(),
                 channel: "main".into(),
@@ -1388,6 +1440,15 @@ pub mod tests {
         assert_eq!(index["repo"]["timestamp"], 100_000);
         let package = &index["packages"]["org.example.hello"];
         assert_eq!(package["metadata"]["name"]["en-US"], "Hello");
+        let png_file = serde_json::json!({"name": format!("/icon-{}", hex::encode(Sha256::digest(&png))), "sha256": hex::encode(Sha256::digest(&png)), "size": png.len()});
+        assert_eq!(index["repo"]["icon"]["en-US"], png_file);
+        assert_eq!(package["metadata"]["icon"]["en-US"], png_file);
+        let shots = &package["metadata"]["screenshots"]["phone"]["en-US"];
+        assert_eq!(shots.as_array().unwrap().len(), 1);
+        assert_eq!(shots[0]["name"], format!("/screenshot-{}", hex::encode(Sha256::digest(&png))));
+        assert_eq!(package["metadata"]["categories"], serde_json::json!(["nostr", "social-media"]));
+        assert_eq!(index["repo"]["categories"]["social-media"]["name"]["en-US"], "Social Media");
+        assert_eq!(repo.screenshots.len(), 1);
         let version = &package["versions"][&sha256];
         assert_eq!(version["manifest"]["versionCode"], 10203);
         assert_eq!(version["file"]["name"], format!("/{sha256}/org.example.hello_10203.apk"));

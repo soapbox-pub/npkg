@@ -29,6 +29,10 @@ pub struct Application {
     pub website: Option<String>,
     pub repository: Option<String>,
     pub license: Option<String>,
+    /// Screenshots, from its `image` tags, in order.
+    pub images: Vec<String>,
+    /// Its `t` tags: topics, which F-Droid shows as categories.
+    pub topics: Vec<String>,
     pub created_at: i64,
 }
 
@@ -139,6 +143,8 @@ pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
             website: event.tag("url").map(str::to_string),
             repository: event.tag("repository").map(str::to_string),
             license: event.tag("license").map(one_line),
+            images: tag_values(event, "image").map(str::to_string).collect(),
+            topics: tag_values(event, "t").map(str::to_string).collect(),
             created_at: event.created_at,
         });
 
