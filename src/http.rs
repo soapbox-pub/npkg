@@ -225,15 +225,18 @@ async fn html_error(state: &AppState, response: Response) -> Response {
     page
 }
 
-/// The stylesheet, script and icon the pages use.
-async fn asset(Path(file): Path<String>) -> Response {
+/// The stylesheet, script and icon the pages use. Pages ask for the first
+/// two by a URL versioned by their contents, which can be kept for good.
+async fn asset(Path(file): Path<String>, Query(query): Query<HashMap<String, String>>) -> Response {
     let (content_type, body) = match file.as_str() {
         "style.css" => ("text/css; charset=utf-8", pages::STYLE),
         "app.js" => ("text/javascript; charset=utf-8", pages::SCRIPT),
         "favicon.svg" => ("image/svg+xml", pages::FAVICON),
         _ => return error(StatusCode::NOT_FOUND, "There's no such file."),
     };
-    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=300")], body).into_response()
+    let current = query.get("v").is_some_and(|v| pages::is_current_asset(&file, v));
+    let cache = if current { "public, max-age=31536000, immutable" } else { "public, max-age=300" };
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, cache)], body).into_response()
 }
 
 fn jpeg(body: Vec<u8>, cache: &'static str) -> Response {

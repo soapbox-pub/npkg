@@ -10,6 +10,15 @@ fn escapes_what_authors_write() {
 }
 
 #[test]
+fn versions_the_stylesheet_and_script_by_their_contents() {
+    let page = error(&SITE, 404, "Not Found", "Gone.");
+    let v = STYLE_URL.split_once("?v=").unwrap().1;
+    assert!(page.contains(&format!(r#"href="/assets/style.css?v={v}""#)) && page.contains(&format!(r#"src="{}""#, *SCRIPT_URL)));
+    assert!(is_current_asset("style.css", v));
+    assert!(!is_current_asset("style.css", "000000000000") && !is_current_asset("app.js", v));
+}
+
+#[test]
 fn draws_a_qr_code() {
     let svg = qr("https://pkg.example.com/fdroid/x/y/repo?fingerprint=ab");
     assert!(svg.starts_with("<svg") && svg.contains("M4 4h1v1h-1z"), "{svg}");

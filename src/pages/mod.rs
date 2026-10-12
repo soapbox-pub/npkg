@@ -22,6 +22,22 @@ pub const STYLE: &str = concat!(include_str!("wood.css"), include_str!("style.cs
 pub const SCRIPT: &str = include_str!("app.js");
 pub const FAVICON: &str = include_str!("favicon.svg");
 
+/// Where pages load the stylesheet and script from, versioned by their
+/// contents: a cache in between keeps them a while, and a page must never
+/// get one older than itself.
+static STYLE_URL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| versioned("style.css", STYLE));
+static SCRIPT_URL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| versioned("app.js", SCRIPT));
+
+fn versioned(file: &str, content: &str) -> String {
+    format!("/assets/{file}?v={}", hex::encode(&Sha256::digest(content)[..6]))
+}
+
+/// Whether `?v=` is the version of `file` pages ask for now.
+pub fn is_current_asset(file: &str, v: &str) -> bool {
+    let url = format!("/assets/{file}?v={v}");
+    url == *STYLE_URL || url == *SCRIPT_URL
+}
+
 /// Nothing runs or loads that the gateway didn't serve itself. `data:`
 /// images are the wood grain the stylesheet draws.
 pub const CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -215,8 +231,8 @@ fn layout(site: &Site, meta: &Head, main: &str) -> String {
 <title>{title}</title>
 {head}
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/style.css">
-<script src="/assets/app.js" defer></script>
+<link rel="stylesheet" href="{style}">
+<script src="{script}" defer></script>
 </head>
 <body>
 <header class="beam wood">
@@ -236,6 +252,8 @@ fn layout(site: &Site, meta: &Head, main: &str) -> String {
         title = esc(meta.title),
         fingerprint = esc(site.fingerprint),
         base = esc(site.base),
+        style = *STYLE_URL,
+        script = *SCRIPT_URL,
     )
 }
 
