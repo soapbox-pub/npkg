@@ -21,8 +21,14 @@ pub const SYSTEM_PATH: &str = "/etc/npkg/npkg.toml";
 /// `data_dir` when the file doesn't say, for root.
 const SYSTEM_DATA_DIR: &str = "/var/lib/npkg";
 
-const DEFAULT_RELAYS: [&str; 5] =
-    ["wss://relay.ditto.pub", "wss://relay.primal.net", "wss://relay.ngit.dev", "wss://relay.damus.io", "wss://nos.lol"];
+const DEFAULT_RELAYS: [&str; 6] = [
+    "wss://relay.ditto.pub",
+    "wss://relay.primal.net",
+    "wss://relay.ngit.dev",
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.zapstore.dev",
+];
 const DEFAULT_BLOSSOM_SERVERS: [&str; 2] = ["https://blossom.ditto.pub", "https://blossom.primal.net"];
 
 /// The file, resolved and validated.

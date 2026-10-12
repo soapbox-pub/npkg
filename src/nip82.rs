@@ -82,14 +82,11 @@ pub fn valid_d(d: &str) -> bool {
 /// The `d` of every application `pubkey` has published, or published a
 /// release of.
 pub fn applications(events: &[Event], pubkey: &str) -> BTreeSet<String> {
-    let prefix = format!("{APPLICATION}:{pubkey}:");
     let mut found = BTreeSet::new();
     for event in events.iter().filter(|event| event.pubkey == pubkey) {
         match event.kind {
             APPLICATION => found.extend(event.tag("d").map(str::to_string)),
-            RELEASE => found.extend(
-                tag_values(event, "a").filter_map(|a| a.strip_prefix(&prefix)).filter(|d| event.tag("i") == Some(d)).map(str::to_string),
-            ),
+            RELEASE => found.extend(release_of(event, pubkey).map(str::to_string)),
             _ => {}
         }
     }
@@ -112,11 +109,22 @@ pub fn missing_assets(events: &[Event], pubkey: &str) -> Vec<String> {
     missing
 }
 
+/// The application a release of `pubkey`'s is of: its `i`. An `a` tag
+/// naming the application is optional, as Zapstore's `zsp` writes none,
+/// but a release whose `a` tags name applications must name this one.
+fn release_of<'a>(event: &'a Event, pubkey: &str) -> Option<&'a str> {
+    let d = event.tag("i")?;
+    let mut named = tag_values(event, "a").filter(|a| a.starts_with(&format!("{APPLICATION}:"))).peekable();
+    if named.peek().is_some() && !named.any(|a| a == format!("{APPLICATION}:{pubkey}:{d}")) {
+        return None;
+    }
+    Some(d)
+}
+
 /// The application `pubkey:d`, its releases, and their assets, as `events`
 /// have them. Only events signed by `pubkey` count: anyone can publish an
 /// event that points at someone else's application.
 pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
-    let coordinate = format!("{APPLICATION}:{pubkey}:{d}");
     let events: Vec<&Event> = events.iter().filter(|event| event.pubkey == pubkey).collect();
 
     let application = events
@@ -138,7 +146,7 @@ pub fn snapshot(events: &[Event], pubkey: &str, d: &str) -> Snapshot {
     let mut newest: HashMap<&str, &Event> = HashMap::new();
     for event in events.iter().copied().filter(|event| event.kind == RELEASE) {
         let Some(release_d) = event.tag("d") else { continue };
-        if !has_tag(event, "a", &coordinate) || event.tag("i") != Some(d) {
+        if release_of(event, pubkey) != Some(d) {
             continue;
         }
         let Some(version) = event.tag("version") else { continue };
@@ -273,10 +281,6 @@ fn tag_values<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a s
     event.tags.iter().filter(move |tag| tag.first().map(String::as_str) == Some(name)).filter_map(|tag| tag.get(1).map(String::as_str))
 }
 
-fn has_tag(event: &Event, name: &str, value: &str) -> bool {
-    tag_values(event, name).any(|v| v == value)
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -388,5 +392,23 @@ pub mod tests {
         assert_eq!(snapshot.releases[0].assets.len(), 1);
         assert_eq!(snapshot.releases[0].channel, "main");
         assert_eq!(missing_assets(&events, &alice), ["f".repeat(64)]);
+    }
+
+    #[test]
+    fn reads_a_release_with_no_a_tag_as_zsp_publishes() {
+        let mut events = published(ALICE, "1.0", 100);
+        let alice = events[0].pubkey.clone();
+        events.iter_mut().for_each(|event| event.tags.retain(|tag| tag[0] != "a"));
+        // One naming another application, though, isn't this one's.
+        let mut elsewhere = published(ALICE, "2.0", 200);
+        for tag in elsewhere.iter_mut().flat_map(|event| event.tags.iter_mut()) {
+            if tag[0] == "a" {
+                tag[1] = format!("{APPLICATION}:{alice}:other");
+            }
+        }
+        events.extend(elsewhere);
+        let versions: Vec<String> = snapshot(&events, &alice, "app").releases.into_iter().map(|release| release.version).collect();
+        assert_eq!(versions, ["1.0"]);
+        assert_eq!(applications(&events, &alice), BTreeSet::from(["app".to_string()]));
     }
 }
