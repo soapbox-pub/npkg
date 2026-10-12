@@ -9,6 +9,8 @@
 
 use std::fmt::Write;
 
+use sha2::{Digest, Sha256};
+
 use crate::fdroid;
 use crate::http::{file_stem, flatpak_app, segment};
 use crate::inspect::{Format, Meta};
@@ -70,6 +72,16 @@ impl Kind {
         }
     }
 
+    /// The colour its stamps are inked in.
+    fn ink(self) -> [u8; 3] {
+        match self {
+            Kind::Apt => [0xa8, 0x28, 0x1d],
+            Kind::Rpm => [0x1f, 0x4f, 0x8c],
+            Kind::Flatpak => [0x2c, 0x6a, 0x3a],
+            Kind::Fdroid => [0x6b, 0x3d, 0x8c],
+        }
+    }
+
     fn mime(self) -> &'static str {
         match self {
             Kind::Apt => nip82::DEB_MIME,
@@ -113,7 +125,87 @@ pub fn esc(text: &str) -> String {
     out
 }
 
-fn layout(site: &Site, title: &str, main: &str) -> String {
+/// What a page says about itself to search engines and link previews.
+struct Head<'a> {
+    title: &'a str,
+    description: &'a str,
+    /// The page's path, for its canonical URL; `None` for one that
+    /// shouldn't be indexed, such as an error.
+    path: Option<&'a str>,
+    /// The card's path.
+    image: &'a str,
+    image_alt: &'a str,
+}
+
+/// Where the site's own card is: named by the gateway's version, since it
+/// only changes with the gateway.
+pub const SITE_CARD: &str = concat!("/og/npkg-", env!("CARGO_PKG_VERSION"), ".jpg");
+
+/// The gateway's own card, for the front page and errors.
+pub fn site_card(base: &str) -> anyhow::Result<Vec<u8>> {
+    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().map(|kind| (kind.tool(), kind.ink())).collect();
+    card::render(&card::Card {
+        eyebrow: host(base),
+        title: "Software, crated.",
+        summary: "apt, dnf, Flatpak and F-Droid repositories for software released on Nostr.",
+        icon: None,
+        stamps: &stamps,
+    })
+}
+
+/// An application's card, named by its hash.
+pub fn repo_card(base: &str, repo: &Repo) -> anyhow::Result<(String, Vec<u8>)> {
+    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().filter(|kind| kind.has(repo)).map(|kind| (kind.tool(), kind.ink())).collect();
+    let summary = repo.summary.as_deref().map(one_line).unwrap_or_default();
+    let jpeg = card::render(&card::Card {
+        eyebrow: host(base),
+        title: &one_line(&repo.name),
+        summary: &summary,
+        icon: repo.icon.as_ref().map(|(_, icon)| icon.as_slice()),
+        stamps: &stamps,
+    })?;
+    let name = hex::encode(&Sha256::digest(&jpeg)[..8]);
+    Ok((name, jpeg))
+}
+
+/// `base` without its scheme.
+fn host(base: &str) -> &str {
+    base.split_once("://").map_or(base, |(_, rest)| rest)
+}
+
+fn layout(site: &Site, meta: &Head, main: &str) -> String {
+    let image = format!("{}{}", site.base, meta.image);
+    let mut head = format!(
+        r##"<meta name="description" content="{description}">
+<meta name="theme-color" content="#3a271a">
+<meta property="og:site_name" content="npkg">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{description}">
+<meta property="og:image" content="{image}">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:width" content="{width}">
+<meta property="og:image:height" content="{height}">
+<meta property="og:image:alt" content="{alt}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{description}">
+<meta name="twitter:image" content="{image}">
+<meta name="twitter:image:alt" content="{alt}">"##,
+        title = esc(meta.title),
+        description = esc(meta.description),
+        image = esc(&image),
+        alt = esc(meta.image_alt),
+        width = card::WIDTH,
+        height = card::HEIGHT,
+    );
+    match meta.path {
+        Some(path) => {
+            let url = esc(&format!("{}{path}", site.base));
+            let _ = write!(head, "\n<link rel=\"canonical\" href=\"{url}\">\n<meta property=\"og:url\" content=\"{url}\">");
+        }
+        None => head.push_str("\n<meta name=\"robots\" content=\"noindex\">"),
+    }
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -121,6 +213,7 @@ fn layout(site: &Site, title: &str, main: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+{head}
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/style.css">
 <script src="/assets/app.js" defer></script>
@@ -140,7 +233,7 @@ fn layout(site: &Site, title: &str, main: &str) -> String {
 </body>
 </html>
 "##,
-        title = esc(title),
+        title = esc(meta.title),
         fingerprint = esc(site.fingerprint),
         base = esc(site.base),
     )
@@ -252,6 +345,7 @@ fn qr(data: &str) -> String {
     )
 }
 
+pub mod card;
 mod render;
 pub use render::{error, index, repo};
 

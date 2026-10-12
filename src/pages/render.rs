@@ -33,9 +33,9 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
     }
     // What can be installed first; an application with nothing to install
     // here yet last.
-    let mut repos: Vec<&Arc<Repo>> = repos.iter().collect();
-    repos.sort_by_key(|repo| !Kind::ALL.into_iter().any(|kind| kind.has(repo)));
-    for repo in repos {
+    let mut sorted: Vec<&Arc<Repo>> = repos.iter().collect();
+    sorted.sort_by_key(|repo| !Kind::ALL.into_iter().any(|kind| kind.has(repo)));
+    for repo in sorted {
         let owner = npub(repo);
         let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|kind| kind.has(repo)).collect();
         let first = kinds.first().copied().unwrap_or(Kind::Apt);
@@ -106,12 +106,47 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
         ),
         base = esc(site.base),
     );
-    layout(site, "npkg: software, crated", &main)
+    let names: Vec<String> = repos.iter().map(|repo| one_line(&repo.name)).collect();
+    let description = if names.is_empty() {
+        "apt, dnf, Flatpak and F-Droid repositories for software released on Nostr.".to_string()
+    } else {
+        format!("apt, dnf, Flatpak and F-Droid repositories for software released on Nostr: {}.", names.join(", "))
+    };
+    let head = Head {
+        title: "npkg: software, crated",
+        description: &description,
+        path: Some("/"),
+        image: SITE_CARD,
+        image_alt: "Wooden crates in a warehouse, and a label: Software, crated.",
+    };
+    layout(site, &head, &main)
+}
+
+/// The page's head: its title, a description that says what's on it, and
+/// the application's card.
+fn repo_head(repo: &Repo, owner: &str, kind: Kind) -> (String, String, String, String) {
+    let name = one_line(&repo.name);
+    let title = format!("{name} for {}", kind.tool());
+    let summary = repo.summary.as_deref().map(one_line).map(|summary| format!(" {summary}")).unwrap_or_default();
+    let description = if kind.has(repo) {
+        format!("Install {name} with {} ({}).{summary}", kind.tool(), kind.systems())
+    } else {
+        format!("{name} isn't released for {}.{summary}", kind.tool())
+    };
+    let image = match &repo.card {
+        Some((hash, _)) => format!("/og/{}/{}/{hash}.jpg", npub(repo), segment(&repo.d)),
+        None => SITE_CARD.to_string(),
+    };
+    let path = format!("/{}/{owner}/{}", kind.path(), segment(&repo.d));
+    (title, description, image, path)
 }
 
 /// A repository's page for one kind of repository, on the channel ranked
 /// `rank`. `owner` is as the URL gave it.
 pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> String {
+    let (title, description, image, path) = repo_head(repo, owner, kind);
+    let alt = format!("{}, on a label in a warehouse of wooden crates", one_line(&repo.name));
+    let head = Head { title: &title, description: &description, path: Some(&path), image: &image, image_alt: &alt };
     let mut main = plaque(repo, owner, kind);
     if !kind.has(repo) {
         let _ = write!(
@@ -123,7 +158,7 @@ pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> S
             kind.systems(),
             elsewhere(repo, owner)
         );
-        return layout(site, &format!("{} for {}", repo.name, kind.tool()), &main);
+        return layout(site, &head, &main);
     }
     let d = segment(&repo.d);
     let at = format!("{}/{}/{owner}/{d}", site.base, kind.path());
@@ -143,7 +178,7 @@ pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> S
         r = esc(&releases),
         at = esc(&at),
     );
-    layout(site, &format!("{} for {}", repo.name, kind.tool()), &main)
+    layout(site, &head, &main)
 }
 
 /// The application's nameplate, and a tab for each kind of repository.
@@ -467,5 +502,13 @@ pub fn error(site: &Site, status: u16, reason: &str, message: &str) -> String {
         esc(reason),
         esc(message.trim())
     );
-    layout(site, &format!("{status} {reason}"), &main)
+    let title = format!("{status} {reason}");
+    let head = Head {
+        title: &title,
+        description: message.trim(),
+        path: None,
+        image: SITE_CARD,
+        image_alt: "Wooden crates in a warehouse, and a label: Software, crated.",
+    };
+    layout(site, &head, &main)
 }

@@ -50,6 +50,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/key.asc", get(key))
         .route("/assets/{file}", get(asset))
         .route("/icon/{owner}/{d}/{file}", get(icon))
+        .route("/og/{file}", get(site_card))
+        .route("/og/{owner}/{d}/{file}", get(repo_card))
         .route("/apt/{owner}/{d}", get(apt_page))
         .route("/apt/{owner}/{d}/source", get(apt_source))
         .route("/apt/{owner}/{d}/dists/{suite}/{*path}", get(apt_dists))
@@ -230,6 +232,46 @@ async fn asset(Path(file): Path<String>) -> Response {
         _ => return error(StatusCode::NOT_FOUND, "There's no such file."),
     };
     ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=300")], body).into_response()
+}
+
+fn jpeg(body: Vec<u8>, cache: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, cache)], body).into_response()
+}
+
+/// The gateway's own link-preview card, drawn once.
+async fn site_card(State(state): Shared, Path(file): Path<String>) -> Response {
+    static CARD: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+    if format!("/og/{file}") != pages::SITE_CARD {
+        return error(StatusCode::NOT_FOUND, "There's no such image.");
+    }
+    let card = CARD
+        .get_or_try_init(|| {
+            let base = state.public_url.clone();
+            async move { tokio::task::spawn_blocking(move || pages::site_card(&base)).await? }
+        })
+        .await;
+    match card {
+        // Named by the gateway's version, which is all it changes with.
+        Ok(card) => jpeg(card.clone(), "public, max-age=31536000, immutable"),
+        Err(error) => self::error(StatusCode::INTERNAL_SERVER_ERROR, format!("The card couldn't be drawn: {error:#}.")),
+    }
+}
+
+/// An application's link-preview card. One named by an old hash gets the
+/// current card, briefly cached, so a preview made before still shows.
+async fn repo_card(State(state): Shared, Client(client): Client, Path((owner, d, file)): Path<(String, String, String)>) -> Response {
+    let (repo, _) = match repo(&state, client, &owner, &d).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    let Some((hash, card)) = &repo.card else {
+        return error(StatusCode::NOT_FOUND, "There's no card for this application.");
+    };
+    if file.strip_suffix(".jpg") == Some(hash.as_str()) {
+        jpeg(card.clone(), "public, max-age=31536000, immutable")
+    } else {
+        jpeg(card.clone(), "public, max-age=300")
+    }
 }
 
 /// An application's icon, named by its hash, as its pages show it.

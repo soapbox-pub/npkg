@@ -22,7 +22,9 @@ Opening any of these in a browser shows a page for that kind of
 repository only: how to add it, with commands to copy, its packages, and
 the files it left out and why. The F-Droid page has a QR code to scan, and
 the Flatpak page every version, to go back to. A tool asking for the same
-path gets what it reads instead. Adding them looks like this:
+path gets what it reads instead. Every page has Open Graph and Twitter tags, and
+each application its own preview card, with its icon, name and the kinds of
+repository it has. Adding them looks like this:
 
 ```sh
 # Debian, Ubuntu

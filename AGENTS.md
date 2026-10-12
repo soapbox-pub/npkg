@@ -26,7 +26,10 @@ src/
                  (/releases/<owner>/<d>); the client's address
   pages/         the HTML pages: the front page, one per kind of
                  repository, errors; their CSS, script and icon are
-                 compiled in, under a strict Content-Security-Policy
+                 compiled in, under a strict Content-Security-Policy; link-
+                 preview cards (card.rs), drawn on a painted background
+                 with Zilla Slab (OFL, pages/fonts/) as each repository
+                 is built
   repo.rs        building a repository: inspect, select, pin, render; the
                  built ones, which requests read
   nip82.rs       reading applications, releases and assets from events

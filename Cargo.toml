@@ -41,6 +41,8 @@ base64 = "0.22"
 quick-xml = "0.42.0"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 qrcode = { version = "0.14.1", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+ab_glyph = "0.2.32"
 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["test-util"] }

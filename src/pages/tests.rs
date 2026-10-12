@@ -43,7 +43,22 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
         assert!(!page.contains("Left out"));
     }
 
+    // Its card, and tags for search engines and link previews.
+    let (hash, _) = repo.card.as_ref().unwrap();
+    let card = format!(r#"<meta property="og:image" content="https://pkg.example.com/og/{}/hello/{hash}.jpg">"#, nip19::npub_encode("pk"));
+    assert!(apt.contains(&card), "{apt}");
+    assert!(apt.contains(r#"<meta property="og:title" content="Hello &lt;b&gt; for apt">"#));
+    assert!(apt.contains(r#"<link rel="canonical" href="https://pkg.example.com/apt/soapbox.pub/hello">"#));
+    assert!(
+        apt.contains(
+            r#"<meta name="description" content="Install Hello &lt;b&gt; with apt (Debian · Ubuntu · Mint). Says &quot;hi&quot;">"#
+        )
+    );
+    assert!(apt.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
+
     let index = index(&SITE, &[std::sync::Arc::new(repo)]);
+    assert!(index.contains(&format!(r#"content="https://pkg.example.com{SITE_CARD}""#)));
+    assert!(index.contains("for software released on Nostr: Hello &lt;b&gt;."));
     assert!(index.contains("Hello &lt;b&gt;") && index.contains("Says &quot;hi&quot;"));
     assert!(index.contains(&format!("/apt/{}/hello", nip19::npub_encode("pk"))));
 }
@@ -52,4 +67,11 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
 fn says_what_went_wrong() {
     let page = error(&SITE, 404, "Not Found", "There's no <such> thing.\n");
     assert!(page.contains("404 Not Found") && page.contains("There&#39;s no &lt;such&gt; thing."));
+    assert!(page.contains(r#"<meta name="robots" content="noindex">"#) && !page.contains("canonical"));
+}
+
+#[test]
+fn draws_the_sites_card() {
+    let jpeg = site_card(SITE.base).unwrap();
+    assert_eq!(&jpeg[..3], [0xff, 0xd8, 0xff]);
 }

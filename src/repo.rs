@@ -141,6 +141,8 @@ pub struct Repo {
     pub summary: Option<String>,
     /// The application's icon, named `icon-<sha256>`.
     pub icon: Option<(String, Vec<u8>)>,
+    /// The image link previews show of it, a JPEG, named by its hash.
+    pub card: Option<(String, Vec<u8>)>,
     pub packages: Vec<Package>,
     pub rejections: Vec<Rejection>,
     /// Highest version first.
@@ -530,6 +532,7 @@ impl Repos {
         let mut history = self.db.flatpak_history(pubkey, d).await?;
         let (pubkey, d, snapshot) = (pubkey.to_string(), d.to_string(), snapshot.clone());
         let store = self.store.clone();
+        let public_url = self.public_url.clone();
         // The repository, its F-Droid index's hash and date if they changed,
         // and the commits newly published.
         type Built = (Repo, Option<(String, i64)>, Vec<Published>);
@@ -630,12 +633,13 @@ impl Repos {
                 Some((fdroid, dated)) => (Some(fdroid), dated),
                 None => (None, None),
             };
-            let repo = Repo {
+            let mut repo = Repo {
                 pubkey,
                 d,
                 name,
                 summary,
                 icon,
+                card: None,
                 packages,
                 rejections,
                 releases,
@@ -649,6 +653,11 @@ impl Repos {
                 snapshot,
                 incomplete,
             };
+            // Drawn here, off the runtime's threads, and served from memory.
+            match crate::pages::repo_card(&public_url, &repo) {
+                Ok(card) => repo.card = Some(card),
+                Err(error) => tracing::warn!(pubkey = repo.pubkey, d = repo.d, error = format!("{error:#}"), "no card"),
+            }
             Ok((repo, dated, published))
         })
         .await??;
