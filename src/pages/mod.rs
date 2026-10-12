@@ -245,6 +245,7 @@ fn layout(site: &Site, meta: &Head, main: &str) -> String {
 <footer>
   <p>Every index here is signed with key <code class="copyable">{fingerprint}</code> (<a href="/key.asc">key.asc</a>).</p>
   <p>Served by <strong>npkg</strong> from releases published on Nostr (NIP-82), at {base}.</p>
+  <p><a href="https://gitworkshop.dev/soapbox.pub/npkg">Source code</a></p>
 </footer>
 </body>
 </html>
