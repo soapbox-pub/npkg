@@ -16,7 +16,7 @@ use crate::http::{file_stem, flatpak_app, segment};
 use crate::inspect::{Format, Meta};
 use crate::nip82::{self, one_line};
 use crate::nostr::nip19;
-use crate::repo::{CHANNELS, Package, Repo};
+use crate::repo::{Author, CHANNELS, Package, Repo};
 
 pub const STYLE: &str = concat!(include_str!("wood.css"), include_str!("style.css"));
 pub const SCRIPT: &str = include_str!("app.js");
@@ -371,6 +371,19 @@ fn apk(meta: &Meta) -> Option<&crate::inspect::apk::ApkMeta> {
         Meta::Apk(apk) => Some(apk),
         _ => None,
     }
+}
+
+/// Who published an application: their picture and name.
+fn byline(author: &Author) -> String {
+    let owner = author.owner();
+    let avatar = match &author.picture {
+        Some((name, _)) => {
+            format!(r#"<img class="avatar" src="/avatar/{}/{}" alt="" width="24" height="24">"#, esc(&owner), esc(name))
+        }
+        None => r#"<span class="avatar blank wood" aria-hidden="true"></span>"#.to_string(),
+    };
+    let name = author.name.clone().unwrap_or_else(|| short(&owner));
+    format!(r#"<p class="byline" title="{}">{avatar}<span>{}</span></p>"#, esc(&owner), esc(&name))
 }
 
 fn npub(repo: &Repo) -> String {

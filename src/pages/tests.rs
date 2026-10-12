@@ -25,8 +25,14 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
         app.summary = Some("Says \"hi\"".into());
     }
     let repo = repos(dir.path(), &db).build("pk", "hello", &snapshot, true).await.unwrap();
+    let team = Author {
+        pubkey: "pk".into(),
+        address: Some("soapbox.pub".into()),
+        name: Some("Team <Soapbox>".into()),
+        picture: Some(("avatar-ab".into(), Vec::new())),
+    };
 
-    let deb = super::repo(&SITE, &repo, "soapbox.pub", Kind::Deb, 0);
+    let deb = super::repo(&SITE, &repo, &team, Kind::Deb, 0);
     assert!(deb.contains("sudo curl -fsSL -o /etc/apt/sources.list.d/hello.sources https://pkg.example.com/deb/soapbox.pub/hello/source"));
     assert!(deb.contains("sudo apt install hello"));
     assert!(deb.contains("Hello &lt;b&gt;") && !deb.contains("<b>"));
@@ -34,11 +40,11 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
     // out is a .deb, so it's listed here.
     assert!(!deb.contains("dnf install") && !deb.contains("yum.repos.d") && !deb.contains("/rpm/soapbox.pub/hello/repo"));
     assert!(deb.contains("Left out"));
-    assert!(super::repo(&SITE, &repo, "soapbox.pub", Kind::Deb, 1).contains("/source?channel=beta"));
+    assert!(super::repo(&SITE, &repo, &team, Kind::Deb, 1).contains("/source?channel=beta"));
 
     // No rpm, Flatpak or APK: those pages say so, and point to deb.
     for kind in [Kind::Rpm, Kind::Flatpak, Kind::Fdroid] {
-        let page = super::repo(&SITE, &repo, "soapbox.pub", kind, 0);
+        let page = super::repo(&SITE, &repo, &team, kind, 0);
         assert!(page.contains("isn't released for") && page.contains(r#"class="stamp deb""#));
         assert!(!page.contains("Left out"));
     }
@@ -57,14 +63,23 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
     assert!(deb.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
 
     let repos = [std::sync::Arc::new(repo)];
-    let index = index(&SITE, &repos, nip19::npub_encode);
+    let unknown = |pubkey: &str| std::sync::Arc::new(Author { pubkey: pubkey.into(), ..Default::default() });
+    let index = index(&SITE, &repos, unknown);
     assert!(index.contains(&format!(r#"content="https://pkg.example.com{SITE_CARD}""#)));
     assert!(index.contains("for software released on Nostr: Hello &lt;b&gt;."));
     assert!(index.contains("Hello &lt;b&gt;") && index.contains("Says &quot;hi&quot;"));
     assert!(index.contains(&format!("/deb/{}/hello", nip19::npub_encode("pk"))));
-    // An author with a NIP-05 address is linked by it.
-    let index = super::index(&SITE, &repos, |_| "soapbox.pub".to_string());
+    // An author with no profile is shown by their npub.
+    let npub = nip19::npub_encode("pk");
+    assert!(index.contains(&format!(r#"<span>{}</span>"#, short(&npub))) && index.contains("avatar blank"));
+    // One with a NIP-05 address is linked by it, and shown with their
+    // picture and name.
+    let index = super::index(&SITE, &repos, |_| std::sync::Arc::new(team.clone()));
     assert!(index.contains(r#"href="/deb/soapbox.pub/hello""#) && !index.contains("/deb/npub1"));
+    let byline =
+        r#"<img class="avatar" src="/avatar/soapbox.pub/avatar-ab" alt="" width="24" height="24"><span>Team &lt;Soapbox&gt;</span>"#;
+    assert!(index.contains(byline), "{index}");
+    assert!(deb.contains(byline));
 }
 
 #[test]

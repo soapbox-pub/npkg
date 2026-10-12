@@ -32,7 +32,7 @@ use crate::db::Db;
 use crate::nip82;
 use crate::nostr::nip05::{Address, LookupError, Resolver};
 use crate::nostr::{Event, relay};
-use crate::repo::{Lookup, Repos};
+use crate::repo::{Author, Lookup, Repos};
 
 /// Profiles (NIP-01), for the NIP-05 address pages link an author by.
 const PROFILE: i64 = 0;
@@ -216,20 +216,25 @@ impl Worker {
             }
         }
         self.repos.retain(|pubkey, d| pubkey != author || applications.contains(d));
-        self.confirm_address(author, &events).await;
+        self.read_profile(author, &events, online).await;
     }
 
-    /// Link `author`'s repositories by the NIP-05 address their profile
-    /// gives, once its domain confirms it names them. The resolver keeps
-    /// what it confirmed, so this only waits on the domain the first time.
-    async fn confirm_address(&self, author: &str, events: &[Event]) {
-        let claimed = events
+    /// What pages show of `author`, from their profile: their name, their
+    /// picture, and the NIP-05 address it gives, once its domain confirms it
+    /// names them. The resolver and the database keep what they found, so
+    /// this only waits on the network the first time.
+    async fn read_profile(&self, author: &str, events: &[Event], online: bool) {
+        let previous = self.repos.author(author);
+        let profile = events
             .iter()
             .filter(|event| event.kind == PROFILE)
             .max_by_key(|event| event.created_at)
             .and_then(|event| serde_json::from_str::<Value>(&event.content).ok())
-            .and_then(|profile| Address::parse(profile.get("nip05")?.as_str()?));
-        let confirmed = match claimed {
+            .unwrap_or_default();
+        let field = |key: &str| profile.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty());
+
+        let name = field("display_name").or_else(|| field("name")).map(|name| nip82::one_line(&name.chars().take(64).collect::<String>()));
+        let address = match field("nip05").and_then(Address::parse) {
             None => None,
             Some(address) => match self.names.confirm(&address).await {
                 Ok(pubkey) if pubkey == author => Some(address.owner()),
@@ -237,11 +242,21 @@ impl Worker {
                 // The domain is down: whatever was confirmed before stands.
                 Err(error) => {
                     tracing::warn!(author, %address, ?error, "couldn't confirm an author's NIP-05 address");
-                    return;
+                    previous.address.clone()
                 }
             },
         };
-        self.repos.set_address(author, confirmed);
+        let picture = match field("picture") {
+            None => None,
+            Some(url) => match self.repos.avatar(url, !online).await {
+                Ok(picture) => picture,
+                Err(error) => {
+                    tracing::info!(author, url, error = format!("{error:#}"), "profile picture left out");
+                    previous.picture.clone()
+                }
+            },
+        };
+        self.repos.set_author(author, Author { pubkey: author.to_string(), address, name, picture });
     }
 
     /// Fetch the asset events `author`'s releases list that aren't stored,

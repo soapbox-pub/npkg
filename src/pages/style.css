@@ -94,6 +94,8 @@ section.paper { padding: 26px 30px; }
 .icon.large { width: 104px; height: 104px; border-radius: 22px; }
 .icon.blank { display: grid; place-items: center; font: 900 34px "Rockwell", Georgia, serif; color: rgba(40, 18, 4, .8); }
 .icon.large.blank { font-size: 54px; }
+.byline { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 15px; color: var(--ink-soft); }
+.avatar { width: 24px; height: 24px; flex: none; border-radius: 50%; object-fit: cover; background: #fff; box-shadow: 0 0 0 1px rgba(80, 50, 20, .35), 0 1px 3px rgba(0, 0, 0, .35); }
 
 /* Repository pages. */
 .plaque .label { display: flex; gap: 24px; align-items: flex-start; }

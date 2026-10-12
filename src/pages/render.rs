@@ -6,8 +6,9 @@ use std::sync::Arc;
 use super::*;
 
 /// The front page: what the gateway is, and every application it serves.
-/// `owner` gives the owner to link an author's repositories by.
-pub fn index(site: &Site, repos: &[Arc<Repo>], owner: impl Fn(&str) -> String) -> String {
+/// `authors` gives what to show of each author, and link their
+/// repositories by.
+pub fn index(site: &Site, repos: &[Arc<Repo>], authors: impl Fn(&str) -> Arc<Author>) -> String {
     let mut main = String::new();
     let _ = write!(
         main,
@@ -37,7 +38,8 @@ pub fn index(site: &Site, repos: &[Arc<Repo>], owner: impl Fn(&str) -> String) -
     let mut sorted: Vec<&Arc<Repo>> = repos.iter().collect();
     sorted.sort_by_key(|repo| !Kind::ALL.into_iter().any(|kind| kind.has(repo)));
     for repo in sorted {
-        let owner = owner(&repo.pubkey);
+        let author = authors(&repo.pubkey);
+        let owner = author.owner();
         let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|kind| kind.has(repo)).collect();
         let first = kinds.first().copied().unwrap_or(Kind::Deb);
         let href = format!("/{}/{}/{}", first.path(), esc(&owner), esc(&segment(&repo.d)));
@@ -49,8 +51,10 @@ pub fn index(site: &Site, repos: &[Arc<Repo>], owner: impl Fn(&str) -> String) -
   {icon}
   <h3><a href="{href}">{name}</a> {latest}</h3>
   <p class="summary">{summary}</p>
+  {byline}
   <p class="stamps">"#,
             bare = if kinds.is_empty() { " bare" } else { "" },
+            byline = byline(&author),
             icon = icon(repo, &owner, ""),
             name = label(&repo.name),
             summary = repo.summary.as_deref().map(label).unwrap_or_default(),
@@ -143,12 +147,13 @@ fn repo_head(repo: &Repo, owner: &str, kind: Kind) -> (String, String, String, S
 }
 
 /// A repository's page for one kind of repository, on the channel ranked
-/// `rank`. `owner` is as the URL gave it.
-pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> String {
+/// `rank`, linked by its author's owner.
+pub fn repo(site: &Site, repo: &Repo, author: &Author, kind: Kind, rank: usize) -> String {
+    let owner = &author.owner();
     let (title, description, image, path) = repo_head(repo, owner, kind);
     let alt = format!("{}, on a label in a warehouse of wooden crates", one_line(&repo.name));
     let head = Head { title: &title, description: &description, path: Some(&path), image: &image, image_alt: &alt };
-    let mut main = plaque(repo, owner, kind);
+    let mut main = plaque(repo, author, kind);
     if !kind.has(repo) {
         let _ = write!(
             main,
@@ -183,7 +188,8 @@ pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> S
 }
 
 /// The application's nameplate, and a tab for each kind of repository.
-fn plaque(repo: &Repo, owner: &str, kind: Kind) -> String {
+fn plaque(repo: &Repo, author: &Author, kind: Kind) -> String {
+    let owner = &author.owner();
     let application = repo.snapshot.application.as_ref();
     let mut links = String::new();
     for (text, url) in
@@ -207,10 +213,12 @@ fn plaque(repo: &Repo, owner: &str, kind: Kind) -> String {
   <p class="eyebrow"><a href="/">npkg</a> / <span title="{owner}">{short}</span></p>
   <h1>{name}</h1>
   <p class="summary">{summary}</p>
+  {byline}
   <p class="links">{links}</p>
   {description}
 </div></div></section>
 <nav class="tabs" aria-label="Kinds of repository">"#,
+        byline = byline(author),
         icon = icon(repo, owner, "large"),
         owner = esc(owner),
         short = esc(&short(owner)),

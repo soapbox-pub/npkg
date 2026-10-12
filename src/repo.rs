@@ -252,6 +252,27 @@ fn sort_releases(releases: &mut [Release]) {
     releases.sort_by(|a, b| nip82::compare_versions(&b.version, &a.version).then_with(|| b.created_at.cmp(&a.created_at)));
 }
 
+/// An author, as their profile describes them.
+#[derive(Clone, Debug, Default)]
+pub struct Author {
+    pub pubkey: String,
+    /// The NIP-05 address their profile gives and its domain confirms, as
+    /// an owner in a URL: pages link by it.
+    pub address: Option<String>,
+    /// One line.
+    pub name: Option<String>,
+    /// Their picture, named `avatar-<sha256>`.
+    pub picture: Option<(String, Vec<u8>)>,
+}
+
+impl Author {
+    /// The owner pages link their repositories by: their NIP-05 address,
+    /// or else their npub.
+    pub fn owner(&self) -> String {
+        self.address.clone().unwrap_or_else(|| nip19::npub_encode(&self.pubkey))
+    }
+}
+
 /// What the gateway has for a repository someone asks for.
 pub enum Lookup {
     Found(Arc<Repo>),
@@ -275,9 +296,8 @@ pub struct Repos {
     signer: Arc<Signer>,
     /// By author and `d`. Never held across an await.
     built: std::sync::RwLock<HashMap<(String, String), Arc<Repo>>>,
-    /// The NIP-05 address each author's profile gives and its domain
-    /// confirms, as pages link by it. Never held across an await.
-    addresses: std::sync::RwLock<HashMap<String, String>>,
+    /// What pages show of each author. Never held across an await.
+    authors: std::sync::RwLock<HashMap<String, Arc<Author>>>,
     synced: AtomicBool,
 }
 
@@ -305,7 +325,7 @@ impl Repos {
             streaming,
             signer,
             built: Default::default(),
-            addresses: Default::default(),
+            authors: Default::default(),
             synced: AtomicBool::new(false),
         }))
     }
@@ -346,20 +366,23 @@ impl Repos {
         self.built.write().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|(pubkey, d), _| keep(pubkey, d));
     }
 
-    /// Link `pubkey`'s repositories by `address`, or by npub for `None`.
-    pub fn set_address(&self, pubkey: &str, address: Option<String>) {
-        let mut addresses = self.addresses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match address {
-            Some(address) => addresses.insert(pubkey.to_string(), address),
-            None => addresses.remove(pubkey),
-        };
+    pub fn set_author(&self, pubkey: &str, author: Author) {
+        self.authors.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(pubkey.to_string(), Arc::new(author));
     }
 
-    /// The owner pages link `pubkey`'s repositories by: its NIP-05
-    /// address, or else its npub.
-    pub fn owner(&self, pubkey: &str) -> String {
-        let addresses = self.addresses.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        addresses.get(pubkey).cloned().unwrap_or_else(|| crate::nostr::nip19::npub_encode(pubkey))
+    /// What pages show of `pubkey`: nothing but their key, until their
+    /// profile is read.
+    pub fn author(&self, pubkey: &str) -> Arc<Author> {
+        let authors = self.authors.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        authors.get(pubkey).cloned().unwrap_or_else(|| Arc::new(Author { pubkey: pubkey.to_string(), ..Default::default() }))
+    }
+
+    /// `pubkey`'s profile picture at `url`, from the database, or
+    /// downloaded unless `offline`. `None` if it isn't an image a page can
+    /// show.
+    pub async fn avatar(&self, url: &str, offline: bool) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let image = self.image(url, MAX_ICON, offline).await?.filter(|data| image_type(data).is_some());
+        Ok(image.map(|data| (format!("avatar-{}", hex::encode(Sha256::digest(&data))), data)))
     }
 
     /// From now on, a repository that isn't built doesn't exist.

@@ -51,6 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/key.asc", get(key))
         .route("/assets/{file}", get(asset))
         .route("/icon/{owner}/{d}/{file}", get(icon))
+        .route("/avatar/{owner}/{file}", get(avatar))
         .route("/og/{file}", get(site_card))
         .route("/og/{owner}/{d}/{file}", get(repo_card))
         .route("/deb/{owner}/{d}", get(apt_page))
@@ -193,7 +194,7 @@ async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> R
 async fn index(State(state): Shared) -> Response {
     let fingerprint = state.repos.signer().fingerprint();
     let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
-    html(StatusCode::OK, pages::index(&site, &state.repos.all(), |pubkey| state.repos.owner(pubkey)))
+    html(StatusCode::OK, pages::index(&site, &state.repos.all(), |pubkey| state.repos.author(pubkey)))
 }
 
 async fn key(State(state): Shared) -> Response {
@@ -283,9 +284,25 @@ async fn icon(State(state): Shared, Client(client): Client, Path((owner, d, file
     }
 }
 
+/// An author's profile picture, named by its hash, as pages show it.
+async fn avatar(State(state): Shared, Client(client): Client, Path((owner_value, file)): Path<(String, String)>) -> Response {
+    let pubkey = match owner(&state, client, &owner_value).await {
+        Ok((pubkey, _)) if state.authors.contains(&pubkey) => pubkey,
+        Ok(_) => return error(StatusCode::NOT_FOUND, "This gateway only shows its team's pictures."),
+        Err(response) => return response,
+    };
+    let author = state.repos.author(&pubkey);
+    image(author.picture.iter().find(|(name, _)| *name == file)).unwrap_or_else(|| error(StatusCode::NOT_FOUND, "There's no such picture."))
+}
+
 /// The application's icon or one of its screenshots, if it's called `file`.
 fn icon_file(repo: &Repo, file: &str) -> Option<Response> {
-    let (_, icon) = repo.icon.iter().chain(&repo.screenshots).find(|(name, _)| name == file)?;
+    image(repo.icon.iter().chain(&repo.screenshots).find(|(name, _)| name == file))
+}
+
+/// An image named by its hash.
+fn image(found: Option<&(String, Vec<u8>)>) -> Option<Response> {
+    let (_, icon) = found?;
     // Anything else isn't one a page shows: an SVG could carry script.
     let content_type = crate::repo::image_type(icon).unwrap_or("application/octet-stream");
     // Named by its hash, so it never changes.
@@ -339,14 +356,14 @@ async fn repo_page(state: &AppState, client: IpAddr, owner: &str, d: &str, query
     };
     // Whichever form the URL used, the page links and gives commands by the
     // author's NIP-05 address, if they have one.
-    let owner = state.repos.owner(&repo.pubkey);
+    let author = state.repos.author(&repo.pubkey);
     let rank = match setup_channel(query) {
         Ok(channel) => channel_rank(channel).unwrap_or(0),
         Err(response) => return html_error(state, response).await,
     };
     let fingerprint = state.repos.signer().fingerprint();
     let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
-    html(StatusCode::OK, pages::repo(&site, &repo, &owner, kind, rank))
+    html(StatusCode::OK, pages::repo(&site, &repo, &author, kind, rank))
 }
 
 /// `d`, as one segment of a URL path.
