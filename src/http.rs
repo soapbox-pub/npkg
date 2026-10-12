@@ -2,9 +2,10 @@
 //! application's author and `d` tag: `/deb/<owner>/<d>`, `/rpm/<owner>/<d>`,
 //! `/flatpak/<owner>/<d>`, `/fdroid/<owner>/<d>`.
 //! The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
-//! `soapbox.pub` for `_@soapbox.pub`). The URLs a repository hands out keep
-//! the form they were asked for by, so a NIP-05 repository follows its name
-//! to whatever key the domain gives it.
+//! `soapbox.pub` for `_@soapbox.pub`). The setup files a repository hands
+//! out keep the form they were asked for by, so a NIP-05 repository follows
+//! its name to whatever key the domain gives it. Pages link by the author's
+//! confirmed NIP-05 address, whichever form they were asked for by.
 
 // Handlers return early with a response from helpers; boxing it would only
 // add noise to every call.
@@ -192,7 +193,7 @@ async fn repo(state: &AppState, client: IpAddr, owner_value: &str, d: &str) -> R
 async fn index(State(state): Shared) -> Response {
     let fingerprint = state.repos.signer().fingerprint();
     let site = pages::Site { base: &state.public_url, fingerprint: &fingerprint };
-    html(StatusCode::OK, pages::index(&site, &state.repos.all()))
+    html(StatusCode::OK, pages::index(&site, &state.repos.all(), |pubkey| state.repos.owner(pubkey)))
 }
 
 async fn key(State(state): Shared) -> Response {
@@ -332,10 +333,13 @@ async fn fdroid_page(
 
 /// What one kind of repository holds, how to add it, and what it left out.
 async fn repo_page(state: &AppState, client: IpAddr, owner: &str, d: &str, query: &HashMap<String, String>, kind: Kind) -> Response {
-    let (repo, owner) = match repo(state, client, owner, d).await {
+    let (repo, _) = match repo(state, client, owner, d).await {
         Ok(found) => found,
         Err(response) => return html_error(state, response).await,
     };
+    // Whichever form the URL used, the page links and gives commands by the
+    // author's NIP-05 address, if they have one.
+    let owner = state.repos.owner(&repo.pubkey);
     let rank = match setup_channel(query) {
         Ok(channel) => channel_rank(channel).unwrap_or(0),
         Err(response) => return html_error(state, response).await,

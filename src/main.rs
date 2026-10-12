@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 resync_interval: config.resync_interval,
                 db,
                 repos: repos.clone(),
+                names: names.clone(),
             }
             .start();
             let public_url = config.public_url.clone();

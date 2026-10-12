@@ -74,6 +74,14 @@ impl Address {
     }
 }
 
+impl Address {
+    /// The address as an owner in a URL: `name@domain`, or the bare domain
+    /// for `_@domain`.
+    pub fn owner(&self) -> String {
+        if self.name == "_" { self.domain.clone() } else { self.to_string() }
+    }
+}
+
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.name, self.domain)
@@ -155,6 +163,17 @@ impl Resolver {
     /// The hex pubkey `address` names, for `client`. Only an address with
     /// no team key known waits on its domain, and counts against the limits.
     pub async fn resolve(self: &Arc<Self>, address: &Address, client: IpAddr) -> Result<String, LookupError> {
+        self.resolve_for(address, Some(client)).await
+    }
+
+    /// The hex pubkey `address` names, for the gateway itself: the address
+    /// an author's profile gives, which the pages link by. Not limited, as
+    /// there's one per author.
+    pub async fn confirm(self: &Arc<Self>, address: &Address) -> Result<String, LookupError> {
+        self.resolve_for(address, None).await
+    }
+
+    async fn resolve_for(self: &Arc<Self>, address: &Address, client: Option<IpAddr>) -> Result<String, LookupError> {
         let slot = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(address.clone()).or_default().clone();
         let mut entry = slot.entry.lock().await;
         if !entry.loaded {
@@ -177,7 +196,7 @@ impl Resolver {
             return Ok(pubkey.clone());
         }
 
-        let result = match self.admit(client) {
+        let result = match client.map(|client| self.admit(client)).transpose() {
             Ok(_permit) => self.lookup(address).await,
             Err(error) => Err(error),
         };

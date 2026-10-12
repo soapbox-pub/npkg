@@ -275,6 +275,9 @@ pub struct Repos {
     signer: Arc<Signer>,
     /// By author and `d`. Never held across an await.
     built: std::sync::RwLock<HashMap<(String, String), Arc<Repo>>>,
+    /// The NIP-05 address each author's profile gives and its domain
+    /// confirms, as pages link by it. Never held across an await.
+    addresses: std::sync::RwLock<HashMap<String, String>>,
     synced: AtomicBool,
 }
 
@@ -302,6 +305,7 @@ impl Repos {
             streaming,
             signer,
             built: Default::default(),
+            addresses: Default::default(),
             synced: AtomicBool::new(false),
         }))
     }
@@ -340,6 +344,22 @@ impl Repos {
     /// Stop serving every repository `keep` says no to.
     pub fn retain(&self, keep: impl Fn(&str, &str) -> bool) {
         self.built.write().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|(pubkey, d), _| keep(pubkey, d));
+    }
+
+    /// Link `pubkey`'s repositories by `address`, or by npub for `None`.
+    pub fn set_address(&self, pubkey: &str, address: Option<String>) {
+        let mut addresses = self.addresses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match address {
+            Some(address) => addresses.insert(pubkey.to_string(), address),
+            None => addresses.remove(pubkey),
+        };
+    }
+
+    /// The owner pages link `pubkey`'s repositories by: its NIP-05
+    /// address, or else its npub.
+    pub fn owner(&self, pubkey: &str) -> String {
+        let addresses = self.addresses.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        addresses.get(pubkey).cloned().unwrap_or_else(|| crate::nostr::nip19::npub_encode(pubkey))
     }
 
     /// From now on, a repository that isn't built doesn't exist.

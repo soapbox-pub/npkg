@@ -25,13 +25,22 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use crate::db::Db;
 use crate::nip82;
+use crate::nostr::nip05::{Address, LookupError, Resolver};
 use crate::nostr::{Event, relay};
 use crate::repo::{Lookup, Repos};
+
+/// Profiles (NIP-01), for the NIP-05 address pages link an author by.
+const PROFILE: i64 = 0;
+
+/// Whether the gateway keeps events of `kind`.
+fn followed(kind: i64) -> bool {
+    kind == PROFILE || nip82::KINDS.contains(&kind)
+}
 
 /// How long a full fetch waits on relays, per round of queries.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,6 +76,7 @@ pub struct Worker {
     pub resync_interval: Duration,
     pub db: Db,
     pub repos: Arc<Repos>,
+    pub names: Arc<Resolver>,
 }
 
 impl Worker {
@@ -85,7 +95,8 @@ impl Worker {
             self.rebuild(author, false, false).await;
         }
 
-        let filter = json!({"kinds": nip82::KINDS, "authors": authors});
+        let kinds: Vec<i64> = std::iter::once(PROFILE).chain(nip82::KINDS).collect();
+        let filter = json!({"kinds": kinds, "authors": authors});
         let mut live = relay::subscribe(&self.relays, vec![filter]);
         let mut resync = tokio::time::interval(self.resync_interval);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -136,7 +147,7 @@ impl Worker {
 
     /// Store a live event, and say whose it was if it was new.
     async fn store(&self, event: Event) -> Option<String> {
-        if !self.authors.contains(&event.pubkey) || !nip82::KINDS.contains(&event.kind) || !not_future(&event) {
+        if !self.authors.contains(&event.pubkey) || !followed(event.kind) || !not_future(&event) {
             return None;
         }
         let author = event.pubkey.clone();
@@ -152,7 +163,7 @@ impl Worker {
 
     /// Ask relays for everything `author` has published, then rebuild.
     async fn resync(&self, author: &str) {
-        let kinds = [nip82::APPLICATION, nip82::RELEASE, nip82::DELETION];
+        let kinds = [PROFILE, nip82::APPLICATION, nip82::RELEASE, nip82::DELETION];
         let filter = json!({"kinds": kinds, "authors": [author]});
         match relay::query(&self.relays, &[filter], QUERY_TIMEOUT).await {
             Ok(events) => {
@@ -205,6 +216,32 @@ impl Worker {
             }
         }
         self.repos.retain(|pubkey, d| pubkey != author || applications.contains(d));
+        self.confirm_address(author, &events).await;
+    }
+
+    /// Link `author`'s repositories by the NIP-05 address their profile
+    /// gives, once its domain confirms it names them. The resolver keeps
+    /// what it confirmed, so this only waits on the domain the first time.
+    async fn confirm_address(&self, author: &str, events: &[Event]) {
+        let claimed = events
+            .iter()
+            .filter(|event| event.kind == PROFILE)
+            .max_by_key(|event| event.created_at)
+            .and_then(|event| serde_json::from_str::<Value>(&event.content).ok())
+            .and_then(|profile| Address::parse(profile.get("nip05")?.as_str()?));
+        let confirmed = match claimed {
+            None => None,
+            Some(address) => match self.names.confirm(&address).await {
+                Ok(pubkey) if pubkey == author => Some(address.owner()),
+                Ok(_) | Err(LookupError::NotFound(_)) => None,
+                // The domain is down: whatever was confirmed before stands.
+                Err(error) => {
+                    tracing::warn!(author, %address, ?error, "couldn't confirm an author's NIP-05 address");
+                    return;
+                }
+            },
+        };
+        self.repos.set_address(author, confirmed);
     }
 
     /// Fetch the asset events `author`'s releases list that aren't stored,

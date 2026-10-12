@@ -56,11 +56,15 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
     );
     assert!(deb.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
 
-    let index = index(&SITE, &[std::sync::Arc::new(repo)]);
+    let repos = [std::sync::Arc::new(repo)];
+    let index = index(&SITE, &repos, nip19::npub_encode);
     assert!(index.contains(&format!(r#"content="https://pkg.example.com{SITE_CARD}""#)));
     assert!(index.contains("for software released on Nostr: Hello &lt;b&gt;."));
     assert!(index.contains("Hello &lt;b&gt;") && index.contains("Says &quot;hi&quot;"));
     assert!(index.contains(&format!("/deb/{}/hello", nip19::npub_encode("pk"))));
+    // An author with a NIP-05 address is linked by it.
+    let index = super::index(&SITE, &repos, |_| "soapbox.pub".to_string());
+    assert!(index.contains(r#"href="/deb/soapbox.pub/hello""#) && !index.contains("/deb/npub1"));
 }
 
 #[test]

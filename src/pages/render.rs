@@ -6,7 +6,8 @@ use std::sync::Arc;
 use super::*;
 
 /// The front page: what the gateway is, and every application it serves.
-pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
+/// `owner` gives the owner to link an author's repositories by.
+pub fn index(site: &Site, repos: &[Arc<Repo>], owner: impl Fn(&str) -> String) -> String {
     let mut main = String::new();
     let _ = write!(
         main,
@@ -36,7 +37,7 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
     let mut sorted: Vec<&Arc<Repo>> = repos.iter().collect();
     sorted.sort_by_key(|repo| !Kind::ALL.into_iter().any(|kind| kind.has(repo)));
     for repo in sorted {
-        let owner = npub(repo);
+        let owner = owner(&repo.pubkey);
         let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|kind| kind.has(repo)).collect();
         let first = kinds.first().copied().unwrap_or(Kind::Deb);
         let href = format!("/{}/{}/{}", first.path(), esc(&owner), esc(&segment(&repo.d)));

@@ -361,13 +361,18 @@ impl Db {
     }
 
     /// Store whichever of `events` are new, and return how many were. Of
-    /// addressable events (kinds 30000-39999) only the newest for each
-    /// address is kept, as NIP-01 has relays do.
+    /// replaceable events (kinds 0, 3 and 10000-19999) and addressable ones
+    /// (30000-39999) only the newest for each address is kept, as NIP-01 has
+    /// relays do.
     pub async fn store_events(&self, events: Vec<Event>) -> anyhow::Result<usize> {
         let rows = events
             .into_iter()
             .map(|event| {
-                let d = (30000..40000).contains(&event.kind).then(|| event.tag("d").unwrap_or_default().to_string());
+                let d = match event.kind {
+                    0 | 3 | 10000..20000 => Some(String::new()),
+                    30000..40000 => Some(event.tag("d").unwrap_or_default().to_string()),
+                    _ => None,
+                };
                 Ok((serde_json::to_string(&event)?, d, event))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -462,5 +467,16 @@ mod tests {
         assert_eq!(db.forget_authors_except(&HashSet::from([pubkey.clone()])).await.unwrap(), 0);
         assert_eq!(db.forget_authors_except(&HashSet::new()).await.unwrap(), 4);
         assert!(db.events(&pubkey).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_only_the_newest_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db.sqlite")).unwrap();
+        let secret = "0000000000000000000000000000000000000000000000000000000000000001";
+        let profile = |created_at| Event::sign(secret, created_at, 0, Vec::new(), "{}");
+        assert_eq!(db.store_events(vec![profile(200), profile(100), profile(300)]).await.unwrap(), 2);
+        let stored = db.events(&profile(0).pubkey).await.unwrap();
+        assert_eq!(stored.iter().map(|event| event.created_at).collect::<Vec<_>>(), [300]);
     }
 }

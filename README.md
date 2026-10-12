@@ -17,6 +17,8 @@ author and its `d` tag:
 The owner is the author's npub, or a NIP-05 address that names them:
 `alex@gleasonator.com`, or a bare domain like `soapbox.pub` for
 `_@soapbox.pub`. Setup files keep whichever form they were asked for by.
+The pages link by the NIP-05 address the author's profile gives, once its
+domain confirms it names them, and by the npub otherwise.
 
 Opening any of these in a browser shows a page for that kind of
 repository only: how to add it, with commands to copy, its packages, and
