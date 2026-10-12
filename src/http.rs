@@ -1,5 +1,5 @@
 //! The routes. Every repository is addressed by its format first, then its
-//! application's author and `d` tag: `/apt/<owner>/<d>`, `/rpm/<owner>/<d>`,
+//! application's author and `d` tag: `/deb/<owner>/<d>`, `/rpm/<owner>/<d>`,
 //! `/flatpak/<owner>/<d>`, `/fdroid/<owner>/<d>`.
 //! The owner is an npub or a NIP-05 address (`alex@gleasonator.com`, or
 //! `soapbox.pub` for `_@soapbox.pub`). The URLs a repository hands out keep
@@ -52,10 +52,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/icon/{owner}/{d}/{file}", get(icon))
         .route("/og/{file}", get(site_card))
         .route("/og/{owner}/{d}/{file}", get(repo_card))
-        .route("/apt/{owner}/{d}", get(apt_page))
-        .route("/apt/{owner}/{d}/source", get(apt_source))
-        .route("/apt/{owner}/{d}/dists/{suite}/{*path}", get(apt_dists))
-        .route("/apt/{owner}/{d}/pool/{sha256}/{file}", get(apt_pool))
+        .route("/deb/{owner}/{d}", get(apt_page))
+        .route("/deb/{owner}/{d}/source", get(apt_source))
+        .route("/deb/{owner}/{d}/dists/{suite}/{*path}", get(apt_dists))
+        .route("/deb/{owner}/{d}/pool/{sha256}/{file}", get(apt_pool))
         .route("/rpm/{owner}/{d}", get(rpm_page))
         .route("/rpm/{owner}/{d}/repo", get(rpm_repo))
         .route("/rpm/{owner}/{d}/{channel}/repodata/{file}", get(rpm_repodata))
@@ -300,7 +300,7 @@ async fn apt_page(
     Path((owner, d)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    repo_page(&state, client, &owner, &d, &query, Kind::Apt).await
+    repo_page(&state, client, &owner, &d, &query, Kind::Deb).await
 }
 
 async fn rpm_page(
@@ -393,7 +393,7 @@ async fn apt_source(
     text(
         "text/plain; charset=utf-8",
         format!(
-            "# {}, from npkg\nTypes: deb\nURIs: {}/apt/{}/{}\nSuites: {channel}\nComponents: main\nSigned-By:\n{key}",
+            "# {}, from npkg\nTypes: deb\nURIs: {}/deb/{}/{}\nSuites: {channel}\nComponents: main\nSigned-By:\n{key}",
             repo.name,
             state.public_url,
             owner,

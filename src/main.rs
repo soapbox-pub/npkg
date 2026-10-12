@@ -1,7 +1,7 @@
 //! npkg: apt and dnf repositories for software released on Nostr.
 //!
 //! Each NIP-82 application the team publishes gets its own repository at
-//! `/apt/<owner>/<d>` and `/rpm/<owner>/<d>`, where the owner is its author's
+//! `/deb/<owner>/<d>` and `/rpm/<owner>/<d>`, where the owner is its author's
 //! npub or NIP-05 address, kept current from the author's events as they're
 //! published and signed with the gateway's key.
 

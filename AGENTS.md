@@ -3,7 +3,7 @@
 apt, dnf, Flatpak and F-Droid repositories for software a team releases on
 Nostr (NIP-82).
 The gateway follows the NIP-82 events of the authors its config lists, and
-each application they publish gets a repository, at `/apt/<owner>/<d>` and
+each application they publish gets a repository, at `/deb/<owner>/<d>` and
 `/rpm/<owner>/<d>`, that serves every package its releases list, under any
 name, and an OSTree remote per channel at `/flatpak/<owner>/<d>/<channel>/`
 for the Flatpak bundles they list, and an F-Droid repository at
@@ -149,7 +149,7 @@ cargo run -- -c npkg.toml serve
 N=npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj
 podman run --rm --network host docker.io/library/debian:trixie bash -c "
   apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null &&
-  curl -fsSL -o /etc/apt/sources.list.d/npanel.sources http://127.0.0.1:8099/apt/$N/npanel/source &&
+  curl -fsSL -o /etc/apt/sources.list.d/npanel.sources http://127.0.0.1:8099/deb/$N/npanel/source &&
   apt-get update && apt-get install -y npanel"
 podman run --rm --network host docker.io/library/rockylinux:8 bash -c "
   curl -fsSL -o /etc/yum.repos.d/npanel.repo http://127.0.0.1:8099/rpm/$N/npanel/repo &&

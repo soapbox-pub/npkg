@@ -271,7 +271,7 @@ mod tests {
             title: "A rather long application name that has to shrink",
             summary: &"Words that wrap onto more than one line. ".repeat(10),
             icon: Some(&icon),
-            stamps: &[("apt", [0xa8, 0x28, 0x1d]), ("F-Droid", [0x6b, 0x3d, 0x8c])],
+            stamps: &[("deb", [0xa8, 0x28, 0x1d]), ("F-Droid", [0x6b, 0x3d, 0x8c])],
         };
         let jpeg = render(&card).unwrap();
         let decoded = image::load_from_memory(&jpeg).unwrap();

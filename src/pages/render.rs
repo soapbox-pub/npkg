@@ -12,7 +12,7 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
         main,
         r##"<section class="hero">
   <div class="hero-text">
-    <p class="eyebrow">apt · dnf · Flatpak · F-Droid</p>
+    <p class="eyebrow">deb · rpm · Flatpak · F-Droid</p>
     <h1>Software, <em>crated</em>.</h1>
     <p class="lede">npkg packs the releases its team publishes on Nostr into repositories your package manager already speaks. Add one once, and updates arrive with the rest of your system.</p>
     <p class="actions"><a class="button brass" href="#apps">Browse the apps</a><a class="button" href="#how">How it works</a></p>
@@ -38,7 +38,7 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
     for repo in sorted {
         let owner = npub(repo);
         let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|kind| kind.has(repo)).collect();
-        let first = kinds.first().copied().unwrap_or(Kind::Apt);
+        let first = kinds.first().copied().unwrap_or(Kind::Deb);
         let href = format!("/{}/{}/{}", first.path(), esc(&owner), esc(&segment(&repo.d)));
         let latest = repo.latest(0).map(|release| format!(r#"<span class="tape">v{}</span>"#, label(&release.version))).unwrap_or_default();
         let _ = write!(
@@ -62,7 +62,7 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
                 kind.path(),
                 esc(&owner),
                 esc(&segment(&repo.d)),
-                kind.tool()
+                kind.name()
             );
         }
         if kinds.is_empty() {
@@ -97,7 +97,7 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
         step(
             2,
             "Crated here",
-            "<p>npkg checks every file against its hash, reads what it is, and builds apt, dnf, Flatpak and F-Droid repositories, signed with its own key.</p>"
+            "<p>npkg checks every file against its hash, reads what it is, and builds deb, rpm, Flatpak and F-Droid repositories, signed with its own key.</p>"
         ),
         step(
             3,
@@ -108,9 +108,9 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
     );
     let names: Vec<String> = repos.iter().map(|repo| one_line(&repo.name)).collect();
     let description = if names.is_empty() {
-        "apt, dnf, Flatpak and F-Droid repositories for software released on Nostr.".to_string()
+        "deb, rpm, Flatpak and F-Droid repositories for software released on Nostr.".to_string()
     } else {
-        format!("apt, dnf, Flatpak and F-Droid repositories for software released on Nostr: {}.", names.join(", "))
+        format!("deb, rpm, Flatpak and F-Droid repositories for software released on Nostr: {}.", names.join(", "))
     };
     let head = Head {
         title: "npkg: software, crated",
@@ -126,12 +126,12 @@ pub fn index(site: &Site, repos: &[Arc<Repo>]) -> String {
 /// the application's card.
 fn repo_head(repo: &Repo, owner: &str, kind: Kind) -> (String, String, String, String) {
     let name = one_line(&repo.name);
-    let title = format!("{name} for {}", kind.tool());
+    let title = format!("{name} for {}", kind.name());
     let summary = repo.summary.as_deref().map(one_line).map(|summary| format!(" {summary}")).unwrap_or_default();
     let description = if kind.has(repo) {
-        format!("Install {name} with {} ({}).{summary}", kind.tool(), kind.systems())
+        format!("Install {name} from its {} repository ({}).{summary}", kind.name(), kind.systems())
     } else {
-        format!("{name} isn't released for {}.{summary}", kind.tool())
+        format!("{name} isn't released for {}.{summary}", kind.name())
     };
     let image = match &repo.card {
         Some((hash, _)) => format!("/og/{}/{}/{hash}.jpg", npub(repo), segment(&repo.d)),
@@ -152,9 +152,9 @@ pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> S
         let _ = write!(
             main,
             r#"<section class="crate"><div class="label"><h2>No {} packages</h2><p>{} isn't released for {} ({}).</p>{}</div></section>"#,
-            kind.tool(),
+            kind.name(),
             label(&repo.name),
-            kind.tool(),
+            kind.name(),
             kind.systems(),
             elsewhere(repo, owner)
         );
@@ -163,7 +163,7 @@ pub fn repo(site: &Site, repo: &Repo, owner: &str, kind: Kind, rank: usize) -> S
     let d = segment(&repo.d);
     let at = format!("{}/{}/{owner}/{d}", site.base, kind.path());
     match kind {
-        Kind::Apt => main.push_str(&apt(site, repo, owner, &d, rank)),
+        Kind::Deb => main.push_str(&deb(site, repo, owner, &d, rank)),
         Kind::Rpm => main.push_str(&rpm(site, repo, owner, &d, rank)),
         Kind::Flatpak => main.push_str(&flatpak(site, repo, owner, &d, rank)),
         Kind::Fdroid => main.push_str(&fdroid(repo, owner, &d)),
@@ -226,7 +226,7 @@ fn plaque(repo: &Repo, owner: &str, kind: Kind) -> String {
             other.path(),
             esc(owner),
             esc(&segment(&repo.d)),
-            other.tool(),
+            other.name(),
             other.systems()
         );
     }
@@ -245,7 +245,7 @@ fn elsewhere(repo: &Repo, owner: &str) -> String {
             kind.path(),
             esc(owner),
             esc(&segment(&repo.d)),
-            kind.tool()
+            kind.name()
         );
     }
     out.push_str("</p>");
@@ -264,7 +264,7 @@ fn channels(rank: usize) -> String {
     out
 }
 
-fn apt(site: &Site, repo: &Repo, owner: &str, d: &str, rank: usize) -> String {
+fn deb(site: &Site, repo: &Repo, owner: &str, d: &str, rank: usize) -> String {
     let file = file_stem(&repo.d);
     let source = format!("/etc/apt/sources.list.d/{file}.sources");
     let mut out = format!(r#"<section class="paper install"><h2>Install with apt</h2>{}<ol class="steps">"#, channels(rank));
@@ -273,7 +273,7 @@ fn apt(site: &Site, repo: &Repo, owner: &str, d: &str, rank: usize) -> String {
         "Add the repository",
         &format!(
             "<p>One file holds its address and the key its indexes are signed with.</p>{}",
-            commands(&[format!("sudo curl -fsSL -o {source} {}/apt/{owner}/{d}/source{}", site.base, query(rank))])
+            commands(&[format!("sudo curl -fsSL -o {source} {}/deb/{owner}/{d}/source{}", site.base, query(rank))])
         ),
     ));
     out.push_str(&step(2, "Install", &commands(&["sudo apt update".into(), format!("sudo apt install {}", names(repo, Format::Deb))])));
@@ -329,7 +329,7 @@ fn package_table(repo: &Repo, owner: &str, d: &str, format: Format) -> String {
     for package in packages(repo, format) {
         let (name, version, arch) = (package.meta.name(), package.meta.version(), package.meta.arch());
         let href = match format {
-            Format::Deb => format!("/apt/{owner}/{d}/pool/{}/{}", package.sha256, segment(&format!("{name}_{version}_{arch}.deb"))),
+            Format::Deb => format!("/deb/{owner}/{d}/pool/{}/{}", package.sha256, segment(&format!("{name}_{version}_{arch}.deb"))),
             _ => format!(
                 "/rpm/{owner}/{d}/{}/packages/{}/{}",
                 CHANNELS[package.channel],

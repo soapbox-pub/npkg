@@ -8,7 +8,7 @@ every application they publish gets its own repository, addressed by its
 author and its `d` tag:
 
 ```
-/apt/<owner>/<d>       # Debian, Ubuntu
+/deb/<owner>/<d>       # Debian, Ubuntu
 /rpm/<owner>/<d>       # Fedora, RHEL, Rocky
 /flatpak/<owner>/<d>   # any Linux, through Flatpak
 /fdroid/<owner>/<d>    # Android, through F-Droid
@@ -29,7 +29,7 @@ repository it has. Adding them looks like this:
 ```sh
 # Debian, Ubuntu
 sudo curl -fsSL -o /etc/apt/sources.list.d/npanel.sources \
-  https://<host>/apt/npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj/npanel/source
+  https://<host>/deb/npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj/npanel/source
 sudo apt update && sudo apt install npanel
 
 # Fedora, RHEL

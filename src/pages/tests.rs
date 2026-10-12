@@ -26,41 +26,41 @@ async fn puts_each_kind_of_repository_on_its_own_page() {
     }
     let repo = repos(dir.path(), &db).build("pk", "hello", &snapshot, true).await.unwrap();
 
-    let apt = super::repo(&SITE, &repo, "soapbox.pub", Kind::Apt, 0);
-    assert!(apt.contains("sudo curl -fsSL -o /etc/apt/sources.list.d/hello.sources https://pkg.example.com/apt/soapbox.pub/hello/source"));
-    assert!(apt.contains("sudo apt install hello"));
-    assert!(apt.contains("Hello &lt;b&gt;") && !apt.contains("<b>"));
-    // apt's page says nothing of dnf, and the never-downloaded file it left
+    let deb = super::repo(&SITE, &repo, "soapbox.pub", Kind::Deb, 0);
+    assert!(deb.contains("sudo curl -fsSL -o /etc/apt/sources.list.d/hello.sources https://pkg.example.com/deb/soapbox.pub/hello/source"));
+    assert!(deb.contains("sudo apt install hello"));
+    assert!(deb.contains("Hello &lt;b&gt;") && !deb.contains("<b>"));
+    // The deb page says nothing of dnf, and the never-downloaded file it left
     // out is a .deb, so it's listed here.
-    assert!(!apt.contains("dnf install") && !apt.contains("yum.repos.d") && !apt.contains("/rpm/soapbox.pub/hello/repo"));
-    assert!(apt.contains("Left out"));
-    assert!(super::repo(&SITE, &repo, "soapbox.pub", Kind::Apt, 1).contains("/source?channel=beta"));
+    assert!(!deb.contains("dnf install") && !deb.contains("yum.repos.d") && !deb.contains("/rpm/soapbox.pub/hello/repo"));
+    assert!(deb.contains("Left out"));
+    assert!(super::repo(&SITE, &repo, "soapbox.pub", Kind::Deb, 1).contains("/source?channel=beta"));
 
-    // No rpm, Flatpak or APK: those pages say so, and point to apt.
+    // No rpm, Flatpak or APK: those pages say so, and point to deb.
     for kind in [Kind::Rpm, Kind::Flatpak, Kind::Fdroid] {
         let page = super::repo(&SITE, &repo, "soapbox.pub", kind, 0);
-        assert!(page.contains("isn't released for") && page.contains(r#"class="stamp apt""#));
+        assert!(page.contains("isn't released for") && page.contains(r#"class="stamp deb""#));
         assert!(!page.contains("Left out"));
     }
 
     // Its card, and tags for search engines and link previews.
     let (hash, _) = repo.card.as_ref().unwrap();
     let card = format!(r#"<meta property="og:image" content="https://pkg.example.com/og/{}/hello/{hash}.jpg">"#, nip19::npub_encode("pk"));
-    assert!(apt.contains(&card), "{apt}");
-    assert!(apt.contains(r#"<meta property="og:title" content="Hello &lt;b&gt; for apt">"#));
-    assert!(apt.contains(r#"<link rel="canonical" href="https://pkg.example.com/apt/soapbox.pub/hello">"#));
+    assert!(deb.contains(&card), "{deb}");
+    assert!(deb.contains(r#"<meta property="og:title" content="Hello &lt;b&gt; for deb">"#));
+    assert!(deb.contains(r#"<link rel="canonical" href="https://pkg.example.com/deb/soapbox.pub/hello">"#));
     assert!(
-        apt.contains(
-            r#"<meta name="description" content="Install Hello &lt;b&gt; with apt (Debian · Ubuntu · Mint). Says &quot;hi&quot;">"#
+        deb.contains(
+            r#"<meta name="description" content="Install Hello &lt;b&gt; from its deb repository (Debian · Ubuntu · Mint). Says &quot;hi&quot;">"#
         )
     );
-    assert!(apt.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
+    assert!(deb.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
 
     let index = index(&SITE, &[std::sync::Arc::new(repo)]);
     assert!(index.contains(&format!(r#"content="https://pkg.example.com{SITE_CARD}""#)));
     assert!(index.contains("for software released on Nostr: Hello &lt;b&gt;."));
     assert!(index.contains("Hello &lt;b&gt;") && index.contains("Says &quot;hi&quot;"));
-    assert!(index.contains(&format!("/apt/{}/hello", nip19::npub_encode("pk"))));
+    assert!(index.contains(&format!("/deb/{}/hello", nip19::npub_encode("pk"))));
 }
 
 #[test]

@@ -36,28 +36,28 @@ pub struct Site<'a> {
 /// A kind of repository, each with a page of its own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    Apt,
+    Deb,
     Rpm,
     Flatpak,
     Fdroid,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Apt, Kind::Rpm, Kind::Flatpak, Kind::Fdroid];
+    pub const ALL: [Kind; 4] = [Kind::Deb, Kind::Rpm, Kind::Flatpak, Kind::Fdroid];
 
     fn path(self) -> &'static str {
         match self {
-            Kind::Apt => "apt",
+            Kind::Deb => "deb",
             Kind::Rpm => "rpm",
             Kind::Flatpak => "flatpak",
             Kind::Fdroid => "fdroid",
         }
     }
 
-    fn tool(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Kind::Apt => "apt",
-            Kind::Rpm => "dnf",
+            Kind::Deb => "deb",
+            Kind::Rpm => "rpm",
             Kind::Flatpak => "Flatpak",
             Kind::Fdroid => "F-Droid",
         }
@@ -65,7 +65,7 @@ impl Kind {
 
     fn systems(self) -> &'static str {
         match self {
-            Kind::Apt => "Debian · Ubuntu · Mint",
+            Kind::Deb => "Debian · Ubuntu · Mint",
             Kind::Rpm => "Fedora · RHEL · Rocky",
             Kind::Flatpak => "Any Linux desktop",
             Kind::Fdroid => "Android",
@@ -75,7 +75,7 @@ impl Kind {
     /// The colour its stamps are inked in.
     fn ink(self) -> [u8; 3] {
         match self {
-            Kind::Apt => [0xa8, 0x28, 0x1d],
+            Kind::Deb => [0xa8, 0x28, 0x1d],
             Kind::Rpm => [0x1f, 0x4f, 0x8c],
             Kind::Flatpak => [0x2c, 0x6a, 0x3a],
             Kind::Fdroid => [0x6b, 0x3d, 0x8c],
@@ -84,7 +84,7 @@ impl Kind {
 
     fn mime(self) -> &'static str {
         match self {
-            Kind::Apt => nip82::DEB_MIME,
+            Kind::Deb => nip82::DEB_MIME,
             Kind::Rpm => nip82::RPM_MIME,
             Kind::Flatpak => nip82::FLATPAK_MIME,
             Kind::Fdroid => nip82::APK_MIME,
@@ -93,7 +93,7 @@ impl Kind {
 
     fn format(self) -> Option<Format> {
         match self {
-            Kind::Apt => Some(Format::Deb),
+            Kind::Deb => Some(Format::Deb),
             Kind::Rpm => Some(Format::Rpm),
             Kind::Flatpak => None,
             Kind::Fdroid => Some(Format::Apk),
@@ -143,11 +143,11 @@ pub const SITE_CARD: &str = concat!("/og/npkg-", env!("CARGO_PKG_VERSION"), ".jp
 
 /// The gateway's own card, for the front page and errors.
 pub fn site_card(base: &str) -> anyhow::Result<Vec<u8>> {
-    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().map(|kind| (kind.tool(), kind.ink())).collect();
+    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().map(|kind| (kind.name(), kind.ink())).collect();
     card::render(&card::Card {
         eyebrow: host(base),
         title: "Software, crated.",
-        summary: "apt, dnf, Flatpak and F-Droid repositories for software released on Nostr.",
+        summary: "deb, rpm, Flatpak and F-Droid repositories for software released on Nostr.",
         icon: None,
         stamps: &stamps,
     })
@@ -155,7 +155,7 @@ pub fn site_card(base: &str) -> anyhow::Result<Vec<u8>> {
 
 /// An application's card, named by its hash.
 pub fn repo_card(base: &str, repo: &Repo) -> anyhow::Result<(String, Vec<u8>)> {
-    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().filter(|kind| kind.has(repo)).map(|kind| (kind.tool(), kind.ink())).collect();
+    let stamps: Vec<(&str, [u8; 3])> = Kind::ALL.iter().filter(|kind| kind.has(repo)).map(|kind| (kind.name(), kind.ink())).collect();
     let summary = repo.summary.as_deref().map(one_line).unwrap_or_default();
     let jpeg = card::render(&card::Card {
         eyebrow: host(base),
