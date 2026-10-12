@@ -242,12 +242,14 @@ release of its address, and date the indexes in the future, which apt
 refuses.
 
 If an author's key is stolen, take it off `authors` and restart: the
-gateway forgets their events, and their repositories go. Deletion events
-(NIP-09) aren't followed, so there's no withdrawing a release while the key
-is on the team, short of publishing it again, later, with no assets; and a
-package version the thief published first stays pinned to their file (see
-above), so a fix has to be a new version. Under a new key, the author's
-repositories start afresh, pins included.
+gateway forgets their events, and their repositories go. While the key is
+on the team, a release can be withdrawn with a deletion event (NIP-09) from
+it, naming the release by its `a` address or its `e` id; one republished
+after the deletion stands again. Deleted events stay stored and are left
+out of every build, so a relay that ignored the deletion can't bring them
+back. A package version the thief published first stays pinned to their
+file (see above), though, so a fix has to be a new version. Under a new
+key, the author's repositories start afresh, pins included.
 
 A repository added by NIP-05 address follows the address: the gateway looks
 it up again once a day, so whoever controls the domain decides whose

@@ -5,7 +5,8 @@
 //! 1. At startup, every repository is built from the events already stored,
 //!    without the network, so a restart serves what it served before in
 //!    milliseconds.
-//! 2. A live subscription to the team's NIP-82 events. A new one rebuilds its
+//! 2. A live subscription to the team's NIP-82 events, and their deletions
+//!    (NIP-09), which withdraw releases. A new one rebuilds its
 //!    author's repositories once things have been quiet for [`SETTLE`]: CI
 //!    publishes a release's assets and then the release, and one rebuild for
 //!    the lot is enough.
@@ -151,7 +152,7 @@ impl Worker {
 
     /// Ask relays for everything `author` has published, then rebuild.
     async fn resync(&self, author: &str) {
-        let kinds = [nip82::APPLICATION, nip82::RELEASE];
+        let kinds = [nip82::APPLICATION, nip82::RELEASE, nip82::DELETION];
         let filter = json!({"kinds": kinds, "authors": [author]});
         match relay::query(&self.relays, &[filter], QUERY_TIMEOUT).await {
             Ok(events) => {
@@ -180,12 +181,14 @@ impl Worker {
                 return;
             }
         };
+        // A deleted asset is stored, so it isn't fetched again.
         if online && self.fetch_assets(author, &events).await {
             match self.db.events(author).await {
                 Ok(fresh) => events = fresh,
                 Err(error) => tracing::warn!(author, ?error, "couldn't read stored events"),
             }
         }
+        let events = nip82::standing(events);
 
         let applications = nip82::applications(&events, author);
         for d in &applications {

@@ -1,6 +1,6 @@
 //! NIP-82 software applications (kind 32267), releases (kind 30063) and
-//! assets (kind 3063): what an author has published, read from the events the
-//! gateway has stored.
+//! assets (kind 3063): what an author has published, and not deleted (kind
+//! 5), read from the events the gateway has stored.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -10,9 +10,10 @@ use crate::nostr::{Event, is_hex64};
 pub const APPLICATION: i64 = 32267;
 pub const RELEASE: i64 = 30063;
 pub const ASSET: i64 = 3063;
+pub const DELETION: i64 = 5;
 
 /// Every kind the gateway follows.
-pub const KINDS: [i64; 3] = [APPLICATION, RELEASE, ASSET];
+pub const KINDS: [i64; 4] = [APPLICATION, RELEASE, ASSET, DELETION];
 
 pub const DEB_MIME: &str = "application/vnd.debian.binary-package";
 pub const RPM_MIME: &str = "application/x-rpm";
@@ -96,6 +97,31 @@ pub fn applications(events: &[Event], pubkey: &str) -> BTreeSet<String> {
     }
     found.retain(|d| valid_d(d));
     found
+}
+
+/// `events` without the deletions in them, or what they delete (NIP-09):
+/// the events their `e` tags name, and those at their `a` tags' addresses
+/// dated no later than the deletion, all only by the deletion's author.
+/// Deleted events stay stored and are left out here, so a relay that
+/// ignored a deletion can't bring them back on the next resync.
+pub fn standing(events: Vec<Event>) -> Vec<Event> {
+    let mut ids = HashSet::new();
+    let mut addresses: HashMap<String, i64> = HashMap::new();
+    for deletion in events.iter().filter(|event| event.kind == DELETION) {
+        ids.extend(tag_values(deletion, "e").map(|id| (deletion.pubkey.clone(), id.to_string())));
+        for address in tag_values(deletion, "a").filter(|address| address.split(':').nth(1) == Some(deletion.pubkey.as_str())) {
+            let until = addresses.entry(address.to_string()).or_insert(deletion.created_at);
+            *until = (*until).max(deletion.created_at);
+        }
+    }
+    events
+        .into_iter()
+        .filter(|event| event.kind != DELETION && !ids.contains(&(event.pubkey.clone(), event.id.clone())))
+        .filter(|event| {
+            let address = format!("{}:{}:{}", event.kind, event.pubkey, event.tag("d").unwrap_or_default());
+            !(30000..40000).contains(&event.kind) || addresses.get(&address).is_none_or(|until| event.created_at > *until)
+        })
+        .collect()
 }
 
 /// The ids of the assets `pubkey`'s releases list that aren't in `events`.
@@ -398,6 +424,32 @@ pub mod tests {
         assert_eq!(snapshot.releases[0].assets.len(), 1);
         assert_eq!(snapshot.releases[0].channel, "main");
         assert_eq!(missing_assets(&events, &alice), ["f".repeat(64)]);
+    }
+
+    #[test]
+    fn leaves_out_what_its_author_deleted() {
+        let mut events = published(ALICE, "1.0", 100);
+        let alice = events[0].pubkey.clone();
+        events.extend(published(ALICE, "1.1", 200));
+        events.extend(published(ALICE, "1.2", 300));
+        let release = |version: &str| events.iter().find(|event| event.tag("version") == Some(version)).unwrap().clone();
+        let (one_one, one_two) = (release("1.1"), release("1.2"));
+        let address = |version: &str| format!("{RELEASE}:{alice}:app@{version}");
+        // 1.0 by its address, 1.1 by its id; Mallory can't delete 1.2.
+        events.push(Event::sign(ALICE, 250, DELETION, tags(&[&["a", &address("1.0")], &["e", &one_one.id], &["k", "30063"]]), ""));
+        events.push(Event::sign(MALLORY, 400, DELETION, tags(&[&["a", &address("1.2")], &["e", &one_two.id]]), ""));
+        let versions = |events: Vec<Event>| -> Vec<(String, i64)> {
+            let events = standing(events);
+            assert!(events.iter().all(|event| event.kind != DELETION));
+            snapshot(&events, &alice, "app").releases.into_iter().map(|release| (release.version, release.created_at)).collect()
+        };
+        assert_eq!(versions(events.clone()), [("1.2".to_string(), 300)]);
+
+        // An address is only deleted up to the deletion: 1.0 republished
+        // after it stands.
+        let mut republished = published(ALICE, "1.0", 260);
+        events.push(republished.remove(1));
+        assert_eq!(versions(events), [("1.0".to_string(), 260), ("1.2".to_string(), 300)]);
     }
 
     #[test]

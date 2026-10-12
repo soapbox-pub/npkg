@@ -32,7 +32,8 @@ src/
                  is built
   repo.rs        building a repository: inspect, select, pin, render; the
                  built ones, which requests read
-  nip82.rs       reading applications, releases and assets from events
+  nip82.rs       reading applications, releases and assets from events,
+                 less what their authors deleted
   nostr/         events, NIP-19 (both from npanel), NIP-05 lookups (stored,
                  refreshed daily, limited per client), relay queries and
                  subscriptions
@@ -81,7 +82,8 @@ one up.
 1. Read the application, its releases, and their assets from the stored
    events, which only ever hold events signed by a team member, and only the
    newest of each address. Asset events a release lists but the database
-   lacks are fetched first.
+   lacks are fetched first. What the author deleted (NIP-09) is left out,
+   though kept, so a relay that ignored the deletion can't revive it.
 2. Download each .deb, .rpm and .apk asset not seen before, check its sha256, read
    its metadata, and store that in SQLite by hash. A file's hash never
    changes, so this happens once per file. The file itself isn't kept:
