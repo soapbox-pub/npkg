@@ -220,7 +220,7 @@ fn layout(site: &Site, meta: &Head, main: &str) -> String {
 </head>
 <body>
 <header class="beam wood">
-  <a class="brand" href="/"><span class="brand-crate" aria-hidden="true"></span><span>npkg</span></a>
+  <a class="brand" href="/">npkg</a>
   <nav><a href="/#apps">Apps</a><a href="/#how">How it works</a><a href="/key.asc">Signing key</a></nav>
 </header>
 <main>
